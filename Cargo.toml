@@ -1,0 +1,19 @@
+[package]
+name = "zoro-fps-overlay"
+version = "0.3.2"
+edition = "2021"
+description = "Lightweight Windows FPS overlay with a minimal monochrome egui settings app"
+license = "MIT"
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
