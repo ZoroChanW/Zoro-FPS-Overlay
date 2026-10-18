@@ -4,7 +4,7 @@
 #[cfg(not(windows))]
 compile_error!("Zoro FPS Overlay currently supports Windows only.");
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_void, OsStr};
 use std::fs::{self, OpenOptions};
 use std::mem::{size_of, zeroed};
@@ -13,7 +13,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use eframe::egui;
@@ -60,8 +60,11 @@ const OVERLAY_PAD_X: i32 = 8;
 const OVERLAY_PAD_Y: i32 = 4;
 // Distance from the screen edge when an anchor is used with offset 0.
 const OVERLAY_EDGE_MARGIN: i32 = 24;
-// Vertical gap between overlay lines (physical pixels).
-const OVERLAY_LINE_GAP: i32 = 2;
+// PDH (performance counters) used for the GPU usage reading.
+const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
+const PDH_MORE_DATA: u32 = 0x8000_07D2;
+// Marks "no reading available" in the shared system stats.
+const STAT_NONE: u32 = u32::MAX;
 
 // Win32 aliases and structures. Using raw FFI keeps this project dependency-free.
 type BOOL = i32;
@@ -118,6 +121,34 @@ struct WNDCLASSEXW {
     hIconSm: HICON,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FILETIME { low: u32, high: u32 }
+#[repr(C)]
+struct MEMORYSTATUSEX {
+    dwLength: u32,
+    dwMemoryLoad: u32,
+    ullTotalPhys: u64,
+    ullAvailPhys: u64,
+    ullTotalPageFile: u64,
+    ullAvailPageFile: u64,
+    ullTotalVirtual: u64,
+    ullAvailVirtual: u64,
+    ullAvailExtendedVirtual: u64,
+}
+// PDH_FMT_COUNTERVALUE_ITEM_W with the double member of the value union.
+#[repr(C)]
+struct PdhCounterValueItem { name: *const u16, status: DWORD, double_value: f64 }
+
+#[link(name = "pdh")]
+extern "system" {
+    fn PdhOpenQueryW(data_source: LPCWSTR, user_data: usize, query: *mut HANDLE) -> i32;
+    fn PdhAddEnglishCounterW(query: HANDLE, counter_path: LPCWSTR, user_data: usize, counter: *mut HANDLE) -> i32;
+    fn PdhCollectQueryData(query: HANDLE) -> i32;
+    fn PdhGetFormattedCounterArrayW(counter: HANDLE, format: DWORD, buffer_size: *mut DWORD, item_count: *mut DWORD, items: *mut c_void) -> i32;
+    fn PdhCloseQuery(query: HANDLE) -> i32;
+}
+
 #[link(name = "user32")]
 extern "system" {
     fn SetProcessDpiAwarenessContext(value: HANDLE) -> BOOL;
@@ -159,6 +190,8 @@ extern "system" {
     fn QueryFullProcessImageNameW(process: HANDLE, flags: DWORD, image_name: LPWSTR, size: *mut DWORD) -> BOOL;
     fn WaitForSingleObject(handle: HANDLE, milliseconds: DWORD) -> DWORD;
     fn CloseHandle(handle: HANDLE) -> BOOL;
+    fn GetSystemTimes(idle: *mut FILETIME, kernel: *mut FILETIME, user: *mut FILETIME) -> BOOL;
+    fn GlobalMemoryStatusEx(buffer: *mut MEMORYSTATUSEX) -> BOOL;
 }
 
 #[link(name = "gdi32")]
@@ -193,6 +226,78 @@ struct Capture {
     stats: Arc<SharedStats>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Metric { Fps, Frametime, Low1, Cpu, Ram, Gpu }
+
+// Order in which enabled items appear on the overlay.
+const ALL_METRICS: [Metric; 6] = [Metric::Fps, Metric::Frametime, Metric::Low1, Metric::Cpu, Metric::Ram, Metric::Gpu];
+const FONT_FAMILIES: [&str; 7] = ["Segoe UI", "Consolas", "Arial", "Tahoma", "Verdana", "Bahnschrift", "Courier New"];
+// Slightly lighter than pure black so it never matches the transparency color key.
+const SHADOW_COLORREF: u32 = 0x0012_1212;
+
+impl Metric {
+    // Widest text this item can show; the overlay window and row cells are sized from it.
+    fn sample(self, labels: bool) -> &'static str {
+        match (self, labels) {
+            (Metric::Fps, true) => "1000 FPS",
+            (Metric::Fps, false) => "1000",
+            (Metric::Frametime, _) => "1000.0 ms",
+            (Metric::Low1, true) => "1% low 1000",
+            (Metric::Low1, false) => "1000",
+            (Metric::Cpu, true) => "CPU 100%",
+            (Metric::Ram, true) => "RAM 100%",
+            (Metric::Gpu, true) => "GPU 100%",
+            (_, false) => "100%",
+        }
+    }
+}
+
+// Latest readings shown on the overlay; None means "no reading yet".
+#[derive(Clone, Copy, Default)]
+struct MetricValues {
+    fps: Option<u32>,
+    frametime_ms: Option<f64>,
+    low1: Option<u32>,
+    cpu: Option<u32>,
+    ram: Option<u32>,
+    gpu: Option<u32>,
+}
+
+fn percent_text(label: &str, value: Option<u32>, labels: bool) -> String {
+    match (value, labels) {
+        (Some(v), true) => format!("{} {}%", label, v),
+        (Some(v), false) => format!("{}%", v),
+        (None, true) => format!("{} --", label),
+        (None, false) => "--".to_string(),
+    }
+}
+
+// `note` is a short capture status ("ERR", "...") shown instead of a missing FPS value.
+fn format_metric(metric: Metric, values: &MetricValues, note: &str, labels: bool) -> String {
+    match metric {
+        Metric::Fps => match values.fps {
+            Some(v) if labels => format!("{} FPS", v),
+            Some(v) => v.to_string(),
+            None if !note.is_empty() => format!("FPS {}", note),
+            None if labels => "-- FPS".to_string(),
+            None => "--".to_string(),
+        },
+        Metric::Frametime => match values.frametime_ms {
+            Some(v) => format!("{:.1} ms", v),
+            None => "-- ms".to_string(),
+        },
+        Metric::Low1 => match values.low1 {
+            Some(v) if labels => format!("1% low {}", v),
+            Some(v) => v.to_string(),
+            None if labels => "1% low --".to_string(),
+            None => "--".to_string(),
+        },
+        Metric::Cpu => percent_text("CPU", values.cpu, labels),
+        Metric::Ram => percent_text("RAM", values.ram, labels),
+        Metric::Gpu => percent_text("GPU", values.gpu, labels),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct OverlaySettings {
     // Anchors: 0 = left/top, 1 = center/middle, 2 = right/bottom.
@@ -203,10 +308,23 @@ struct OverlaySettings {
     font_size: i32,
     // User-facing RGB hex, e.g. "E8E4D9". Win32 COLORREF is converted on use.
     color_hex: String,
-    // Which lines the overlay shows, top to bottom in this order.
+    // Which items the overlay shows.
     show_fps: bool,
     show_frametime: bool,
     show_low1: bool,
+    show_cpu: bool,
+    show_ram: bool,
+    show_gpu: bool,
+    // 0 = items stacked in a column, 1 = items side by side in a row.
+    layout: u8,
+    // Gap between stacked lines (column) and between items (row), in pixels.
+    line_gap: i32,
+    item_gap: i32,
+    // "CPU 23%" instead of "23%".
+    show_labels: bool,
+    bold: bool,
+    shadow: bool,
+    font_family: String,
 }
 
 impl Default for OverlaySettings {
@@ -221,44 +339,91 @@ impl Default for OverlaySettings {
             show_fps: true,
             show_frametime: false,
             show_low1: false,
+            show_cpu: false,
+            show_ram: false,
+            show_gpu: false,
+            layout: 0,
+            line_gap: 2,
+            item_gap: 18,
+            show_labels: true,
+            bold: true,
+            shadow: false,
+            font_family: "Segoe UI".to_string(),
         }
     }
 }
 
-fn make_overlay_font(font_size: i32) -> HFONT {
-    let font_name = wide("Segoe UI");
-    unsafe { CreateFontW(font_size, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, font_name.as_ptr()) }
+fn make_overlay_font(settings: &OverlaySettings) -> HFONT {
+    let font_name = wide(&settings.font_family);
+    let weight = if settings.bold { 700 } else { 400 };
+    unsafe { CreateFontW(settings.font_size, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, font_name.as_ptr()) }
 }
 
-// Measures the widest text the overlay can show, so the window can be exactly as
-// wide as its text. A window that is much wider than the text leaves an invisible
-// (transparent) strip that cannot go past the screen edge, which made the visible
-// text stop short of the right side of the monitor.
-fn measure_overlay_text_width(font_size: i32) -> i32 {
+fn text_extent(hdc: HDC, text: &str) -> SIZE {
+    let wide_text = wide(text);
+    let mut size = SIZE { cx: 0, cy: 0 };
     unsafe {
-        let hdc = GetDC(std::ptr::null_mut());
-        if hdc.is_null() { return font_size * 5; }
-        let font = make_overlay_font(font_size);
-        let previous = if !font.is_null() { SelectObject(hdc, font) } else { std::ptr::null_mut() };
-        let sample = wide("1000 FPS");
-        let mut size = SIZE { cx: 0, cy: 0 };
-        let ok = GetTextExtentPoint32W(hdc, sample.as_ptr(), (sample.len() - 1) as i32, &mut size);
-        if !previous.is_null() { SelectObject(hdc, previous); }
-        if !font.is_null() { DeleteObject(font); }
-        ReleaseDC(std::ptr::null_mut(), hdc);
-        if ok != 0 && size.cx > 0 { size.cx } else { font_size * 5 }
+        GetTextExtentPoint32W(hdc, wide_text.as_ptr(), (wide_text.len() - 1) as i32, &mut size);
+    }
+    size
+}
+
+// Draws one overlay item, with an optional soft shadow underneath.
+fn draw_overlay_text(hdc: HDC, text: &str, rc: &mut RECT, align: u32, settings: &OverlaySettings) {
+    let wide_text = wide(text);
+    let count = wide_text.len().saturating_sub(1) as i32;
+    let flags = align | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP;
+    unsafe {
+        if settings.shadow {
+            let o = settings.shadow_offset();
+            let mut shadow_rc = RECT { left: rc.left + o, top: rc.top + o, right: rc.right + o, bottom: rc.bottom + o };
+            SetTextColor(hdc, SHADOW_COLORREF);
+            DrawTextW(hdc, wide_text.as_ptr(), count, &mut shadow_rc, flags);
+        }
+        SetTextColor(hdc, settings.color_ref());
+        DrawTextW(hdc, wide_text.as_ptr(), count, rc, flags);
     }
 }
 
 impl OverlaySettings {
+    fn is_enabled(&self, metric: Metric) -> bool {
+        match metric {
+            Metric::Fps => self.show_fps,
+            Metric::Frametime => self.show_frametime,
+            Metric::Low1 => self.show_low1,
+            Metric::Cpu => self.show_cpu,
+            Metric::Ram => self.show_ram,
+            Metric::Gpu => self.show_gpu,
+        }
+    }
+
+    // Enabled items in display order; the overlay always shows at least FPS.
+    fn metrics(&self) -> Vec<Metric> {
+        let enabled: Vec<Metric> = ALL_METRICS.iter().copied().filter(|m| self.is_enabled(*m)).collect();
+        if enabled.is_empty() { vec![Metric::Fps] } else { enabled }
+    }
+
+    fn shadow_offset(&self) -> i32 {
+        (self.font_size / 16).max(1)
+    }
+
     fn normalize(&mut self) {
         self.horizontal_anchor = self.horizontal_anchor.min(2);
         self.vertical_anchor = self.vertical_anchor.min(2);
         self.offset_x = self.offset_x.clamp(-4000, 4000);
         self.offset_y = self.offset_y.clamp(-4000, 4000);
         self.font_size = self.font_size.clamp(18, 64);
-        // The overlay always shows at least one line.
-        if !self.show_fps && !self.show_frametime && !self.show_low1 {
+        self.layout = self.layout.min(1);
+        self.line_gap = self.line_gap.clamp(0, 40);
+        self.item_gap = self.item_gap.clamp(0, 60);
+        // Only fonts from the known list are accepted (the value ends up in CreateFontW).
+        self.font_family = FONT_FAMILIES
+            .iter()
+            .find(|f| f.eq_ignore_ascii_case(self.font_family.trim()))
+            .unwrap_or(&FONT_FAMILIES[0])
+            .to_string();
+        // The overlay always shows at least one item.
+        if ALL_METRICS.iter().all(|m| !self.is_enabled(*m)) {
             self.show_fps = true;
         }
         self.color_hex = normalize_color(&self.color_hex).unwrap_or_else(|| "E8E4D9".to_string());
@@ -272,59 +437,48 @@ impl OverlaySettings {
         (r >> 16) | g | (b << 16)
     }
 
-    // Widest possible text of each enabled line, used to size the window.
-    fn line_samples(&self) -> Vec<&'static str> {
-        let mut samples = Vec::new();
-        if self.show_fps { samples.push("1000 FPS"); }
-        if self.show_frametime { samples.push("1000.0 ms"); }
-        if self.show_low1 { samples.push("1% low 1000"); }
-        if samples.is_empty() { samples.push("1000 FPS"); }
-        samples
-    }
-
+    // The window is exactly as large as the widest possible text of the enabled items.
+    // A window wider than its text leaves a transparent strip that cannot go past the
+    // screen edge, which would keep right-anchored text away from the monitor edge.
     fn window_size(&self) -> (i32, i32) {
-        let samples = self.line_samples();
-        let (text_w, line_h) = measure_overlay_lines(self.font_size, &samples);
-        let lines = samples.len() as i32;
-        (
-            text_w + OVERLAY_PAD_X * 2 + 2,
-            line_h * lines + OVERLAY_LINE_GAP * (lines - 1) + OVERLAY_PAD_Y * 2,
-        )
+        let samples: Vec<&str> = self.metrics().iter().map(|m| m.sample(self.show_labels)).collect();
+        let (max_w, sum_w, line_h) = measure_overlay_lines(self, &samples);
+        let count = samples.len() as i32;
+        let (text_w, text_h) = if self.layout == 1 {
+            (sum_w + self.item_gap * (count - 1), line_h)
+        } else {
+            (max_w, line_h * count + self.line_gap * (count - 1))
+        };
+        let shadow = if self.shadow { self.shadow_offset() } else { 0 };
+        (text_w + OVERLAY_PAD_X * 2 + 2 + shadow, text_h + OVERLAY_PAD_Y * 2 + shadow)
     }
 }
 
-// Returns (widest line width, line height) for the given sample strings.
-fn measure_overlay_lines(font_size: i32, samples: &[&str]) -> (i32, i32) {
+// Returns (widest sample, sum of all sample widths, line height).
+fn measure_overlay_lines(settings: &OverlaySettings, samples: &[&str]) -> (i32, i32, i32) {
+    let fallback = (
+        settings.font_size * 5,
+        settings.font_size * 5 * samples.len() as i32,
+        settings.font_size,
+    );
     unsafe {
-        let fallback = (font_size * 5, font_size);
         let hdc = GetDC(std::ptr::null_mut());
         if hdc.is_null() { return fallback; }
-        let font = make_overlay_font(font_size);
+        let font = make_overlay_font(settings);
         let previous = if !font.is_null() { SelectObject(hdc, font) } else { std::ptr::null_mut() };
         let mut max_w = 0;
-        let mut max_h = 0;
+        let mut sum_w = 0;
         for sample in samples {
-            let text = wide(sample);
-            let mut size = SIZE { cx: 0, cy: 0 };
-            if GetTextExtentPoint32W(hdc, text.as_ptr(), (text.len() - 1) as i32, &mut size) != 0 {
-                max_w = max_w.max(size.cx);
-                max_h = max_h.max(size.cy);
-            }
+            let width = text_extent(hdc, sample).cx;
+            max_w = max_w.max(width);
+            sum_w += width;
         }
+        let line_h = text_extent(hdc, "Ag").cy.max(settings.font_size);
         if !previous.is_null() { SelectObject(hdc, previous); }
         if !font.is_null() { DeleteObject(font); }
         ReleaseDC(std::ptr::null_mut(), hdc);
-        if max_w > 0 { (max_w, max_h.max(font_size)) } else { fallback }
+        if max_w > 0 { (max_w, sum_w, line_h) } else { fallback }
     }
-}
-
-fn overlay_lines(settings: &OverlaySettings, fps: &str, frametime: &str, low1: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-    if settings.show_fps { lines.push(fps.to_string()); }
-    if settings.show_frametime { lines.push(frametime.to_string()); }
-    if settings.show_low1 { lines.push(low1.to_string()); }
-    if lines.is_empty() { lines.push(fps.to_string()); }
-    lines
 }
 
 fn normalize_color(value: &str) -> Option<String> {
@@ -363,6 +517,16 @@ fn load_settings(path: &PathBuf) -> OverlaySettings {
             "show_fps" => result.show_fps = value == "1",
             "show_frametime" => result.show_frametime = value == "1",
             "show_low1" => result.show_low1 = value == "1",
+            "show_cpu" => result.show_cpu = value == "1",
+            "show_ram" => result.show_ram = value == "1",
+            "show_gpu" => result.show_gpu = value == "1",
+            "layout" => if let Ok(v) = value.parse::<u8>() { result.layout = v; },
+            "line_gap" => if let Ok(v) = value.parse::<i32>() { result.line_gap = v; },
+            "item_gap" => if let Ok(v) = value.parse::<i32>() { result.item_gap = v; },
+            "show_labels" => result.show_labels = value == "1",
+            "bold" => result.bold = value == "1",
+            "shadow" => result.shadow = value == "1",
+            "font_family" => result.font_family = value.to_string(),
             _ => {},
         }
     }
@@ -375,10 +539,16 @@ fn save_settings(path: &PathBuf, settings: &OverlaySettings) -> Result<(), Strin
         fs::create_dir_all(parent).map_err(|e| format!("Couldn't create settings folder: {}", e))?;
     }
     let content = format!(
-        "horizontal_anchor={}\nvertical_anchor={}\noffset_x={}\noffset_y={}\nfont_size={}\ncolor={}\nshow_fps={}\nshow_frametime={}\nshow_low1={}\n",
+        "horizontal_anchor={}\nvertical_anchor={}\noffset_x={}\noffset_y={}\nfont_size={}\ncolor={}\n\
+         show_fps={}\nshow_frametime={}\nshow_low1={}\nshow_cpu={}\nshow_ram={}\nshow_gpu={}\n\
+         layout={}\nline_gap={}\nitem_gap={}\nshow_labels={}\nbold={}\nshadow={}\nfont_family={}\n",
         settings.horizontal_anchor, settings.vertical_anchor, settings.offset_x,
         settings.offset_y, settings.font_size, settings.color_hex,
-        settings.show_fps as u8, settings.show_frametime as u8, settings.show_low1 as u8
+        settings.show_fps as u8, settings.show_frametime as u8, settings.show_low1 as u8,
+        settings.show_cpu as u8, settings.show_ram as u8, settings.show_gpu as u8,
+        settings.layout, settings.line_gap, settings.item_gap,
+        settings.show_labels as u8, settings.bold as u8, settings.shadow as u8,
+        settings.font_family
     );
     fs::write(path, content).map_err(|e| format!("Couldn't save settings: {}", e))
 }
@@ -415,9 +585,9 @@ struct AppState {
     settings: OverlaySettings,
     last_settings_check: Instant,
     capture: Option<Capture>,
-    fps_text: String,
-    frametime_text: String,
-    low1_text: String,
+    values: MetricValues,
+    // Short capture status ("ERR", "...") shown in place of a missing FPS value.
+    fps_note: &'static str,
     visible: bool,
     target_name: Option<String>,
     target_pid: Option<u32>,
@@ -425,6 +595,42 @@ struct AppState {
 }
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
+
+impl AppState {
+    // Forgets the PresentMon readings (system readings are kept).
+    fn clear_capture_values(&mut self, note: &'static str) {
+        self.values.fps = None;
+        self.values.frametime_ms = None;
+        self.values.low1 = None;
+        self.fps_note = note;
+    }
+}
+
+// CPU / RAM / GPU readings, refreshed once a second by a background thread.
+struct SysStats {
+    cpu: AtomicU32,
+    ram: AtomicU32,
+    gpu: AtomicU32,
+    // The GPU counters are only queried while the GPU item is enabled.
+    want_gpu: AtomicBool,
+}
+
+impl SysStats {
+    fn new() -> Self {
+        Self {
+            cpu: AtomicU32::new(STAT_NONE),
+            ram: AtomicU32::new(STAT_NONE),
+            gpu: AtomicU32::new(STAT_NONE),
+            want_gpu: AtomicBool::new(false),
+        }
+    }
+}
+
+static SYS: OnceLock<Arc<SysStats>> = OnceLock::new();
+
+fn stat_value(raw: u32) -> Option<u32> {
+    if raw == STAT_NONE { None } else { Some(raw) }
+}
 
 fn wide(value: &str) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain(std::iter::once(0)).collect()
@@ -569,9 +775,7 @@ fn stop_capture(state: &mut AppState) {
     }
     state.target_name = None;
     state.target_pid = None;
-    state.fps_text = "-- FPS".to_string();
-    state.frametime_text = "-- ms".to_string();
-    state.low1_text = "1% low --".to_string();
+    state.clear_capture_values("");
 }
 
 fn start_capture(state: &mut AppState, process_name: &str, process_id: u32) {
@@ -585,7 +789,7 @@ fn start_capture(state: &mut AppState, process_name: &str, process_id: u32) {
     ));
     if !state.presentmon_path.exists() {
         log_event(&state.diagnostic_path, "ERROR: PresentMon.exe not found next to overlay executable");
-        state.fps_text = "FPS ERR".to_string();
+        state.clear_capture_values("ERR");
         return;
     }
 
@@ -600,7 +804,7 @@ fn start_capture(state: &mut AppState, process_name: &str, process_id: u32) {
     {
         Ok(file) => file,
         Err(e) => {
-            state.fps_text = "FPS ERR".to_string();
+            state.clear_capture_values("ERR");
             log_event(&state.diagnostic_path, &format!("ERROR: could not open PresentMon error log: {}", e));
             return;
         }
@@ -648,11 +852,11 @@ fn start_capture(state: &mut AppState, process_name: &str, process_id: u32) {
                 session_name: session_name.clone(),
                 stats,
             });
-            state.fps_text = "FPS ...".to_string();
+            state.clear_capture_values("...");
             log_event(&state.diagnostic_path, "PresentMon child process spawned; reading CSV from stdout");
         }
         Err(e) => {
-            state.fps_text = "FPS ERR".to_string();
+            state.clear_capture_values("ERR");
             log_event(&state.diagnostic_path, &format!("ERROR: could not launch PresentMon: {}", e));
         }
     }
@@ -809,6 +1013,172 @@ fn spawn_csv_reader<R: Read + Send + 'static>(
     });
 }
 
+fn filetime_u64(ft: &FILETIME) -> u64 {
+    ((ft.high as u64) << 32) | ft.low as u64
+}
+
+fn wide_ptr_to_string(ptr: *const u16) -> String {
+    let mut units: Vec<u16> = Vec::new();
+    if ptr.is_null() { return String::new(); }
+    unsafe {
+        let mut i = 0usize;
+        while i < 512 {
+            let unit = *ptr.add(i);
+            if unit == 0 { break; }
+            units.push(unit);
+            i += 1;
+        }
+    }
+    String::from_utf16_lossy(&units)
+}
+
+// Reads GPU utilization from the Windows "GPU Engine" performance counters (the same
+// source Task Manager uses). It works for NVIDIA, AMD and Intel GPUs on Windows 10+.
+struct GpuSampler {
+    query: HANDLE,
+    counter: HANDLE,
+}
+
+impl GpuSampler {
+    fn new() -> Result<Self, i32> {
+        unsafe {
+            let mut query: HANDLE = std::ptr::null_mut();
+            let status = PdhOpenQueryW(std::ptr::null(), 0, &mut query);
+            if status != 0 { return Err(status); }
+            let path = wide("\\GPU Engine(*)\\Utilization Percentage");
+            let mut counter: HANDLE = std::ptr::null_mut();
+            let status = PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter);
+            if status != 0 {
+                PdhCloseQuery(query);
+                return Err(status);
+            }
+            // The first collection only establishes a baseline.
+            let _ = PdhCollectQueryData(query);
+            Ok(Self { query, counter })
+        }
+    }
+
+    // Busiest engine (3D, compute, copy, video...) of the busiest GPU, in percent.
+    fn sample(&mut self) -> Option<u32> {
+        unsafe {
+            if PdhCollectQueryData(self.query) != 0 { return None; }
+            let mut size: DWORD = 0;
+            let mut count: DWORD = 0;
+            let status = PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut size, &mut count, std::ptr::null_mut());
+            if status as u32 != PDH_MORE_DATA || size == 0 { return None; }
+            // u64 elements keep the buffer 8-byte aligned for PdhCounterValueItem.
+            let mut buffer: Vec<u64> = vec![0; (size as usize + 7) / 8 + 1];
+            let status = PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut size, &mut count, buffer.as_mut_ptr() as *mut c_void);
+            if status != 0 { return None; }
+
+            let items = buffer.as_ptr() as *const PdhCounterValueItem;
+            let mut totals: HashMap<(String, String), f64> = HashMap::new();
+            for i in 0..count as usize {
+                let item = &*items.add(i);
+                // PDH_CSTATUS_VALID_DATA = 0, PDH_CSTATUS_NEW_DATA = 1
+                if item.status != 0 && item.status != 1 { continue; }
+                let name = wide_ptr_to_string(item.name);
+                let luid = name.split("luid_").nth(1)
+                    .and_then(|rest| rest.split("_phys").next())
+                    .unwrap_or("")
+                    .to_string();
+                let engine = name.rsplit("engtype_").next().unwrap_or("").to_string();
+                *totals.entry((luid, engine)).or_insert(0.0) += item.double_value;
+            }
+            let busiest = totals.values().copied().fold(0.0_f64, f64::max);
+            Some(busiest.round().clamp(0.0, 100.0) as u32)
+        }
+    }
+}
+
+impl Drop for GpuSampler {
+    fn drop(&mut self) {
+        unsafe { PdhCloseQuery(self.query); }
+    }
+}
+
+fn spawn_system_stats_thread(stats: Arc<SysStats>, log_path: PathBuf) {
+    std::thread::spawn(move || {
+        let mut previous_cpu: Option<(u64, u64)> = None; // (idle, total) system times
+        let mut gpu_sampler: Option<GpuSampler> = None;
+        let mut gpu_error_logged = false;
+        let mut gpu_samples_taken = 0u32;
+        let mut gpu_misses = 0u32;
+
+        loop {
+            unsafe {
+                let mut idle = FILETIME::default();
+                let mut kernel = FILETIME::default();
+                let mut user = FILETIME::default();
+                if GetSystemTimes(&mut idle, &mut kernel, &mut user) != 0 {
+                    let idle_now = filetime_u64(&idle);
+                    // Kernel time already includes idle time.
+                    let total_now = filetime_u64(&kernel) + filetime_u64(&user);
+                    if let Some((idle_before, total_before)) = previous_cpu {
+                        let total_delta = total_now.saturating_sub(total_before);
+                        let idle_delta = idle_now.saturating_sub(idle_before).min(total_delta);
+                        if total_delta > 0 {
+                            let busy = (total_delta - idle_delta) as f64 / total_delta as f64 * 100.0;
+                            stats.cpu.store(busy.round().clamp(0.0, 100.0) as u32, Ordering::Relaxed);
+                        }
+                    }
+                    previous_cpu = Some((idle_now, total_now));
+                }
+
+                let mut memory: MEMORYSTATUSEX = zeroed();
+                memory.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+                if GlobalMemoryStatusEx(&mut memory) != 0 {
+                    stats.ram.store(memory.dwMemoryLoad.min(100), Ordering::Relaxed);
+                }
+            }
+
+            if stats.want_gpu.load(Ordering::Relaxed) {
+                let mut just_created = false;
+                if gpu_sampler.is_none() {
+                    match GpuSampler::new() {
+                        Ok(sampler) => {
+                            gpu_sampler = Some(sampler);
+                            gpu_samples_taken = 0;
+                            just_created = true;
+                        }
+                        Err(status) => {
+                            if !gpu_error_logged {
+                                log_event(&log_path, &format!("GPU usage counters unavailable (PDH status 0x{:08X})", status as u32));
+                                gpu_error_logged = true;
+                            }
+                            stats.gpu.store(STAT_NONE, Ordering::Relaxed);
+                        }
+                    }
+                }
+                // A sample needs a baseline from an earlier collection, so a new query waits one tick.
+                if !just_created {
+                    if let Some(sampler) = gpu_sampler.as_mut() {
+                        match sampler.sample() {
+                            Some(value) => {
+                                stats.gpu.store(value, Ordering::Relaxed);
+                                gpu_misses = 0;
+                            }
+                            None => {
+                                gpu_misses += 1;
+                                if gpu_misses >= 4 { stats.gpu.store(STAT_NONE, Ordering::Relaxed); }
+                            }
+                        }
+                        gpu_samples_taken += 1;
+                    }
+                }
+                // Wildcard counters are expanded when they are added, so rebuild the query now
+                // and then to pick up the GPU engines of programs started in the meantime.
+                if gpu_samples_taken >= 30 { gpu_sampler = None; }
+            } else if gpu_sampler.is_some() {
+                gpu_sampler = None;
+                stats.gpu.store(STAT_NONE, Ordering::Relaxed);
+            }
+
+            std::thread::sleep(Duration::from_millis(1000));
+        }
+    });
+}
+
 fn update_overlay(hwnd: HWND) {
     let fg = unsafe { GetForegroundWindow() };
     let mut pid: DWORD = 0;
@@ -831,6 +1201,12 @@ fn update_overlay(hwnd: HWND) {
             }
             log_event(&state.diagnostic_path, "Settings reloaded from settings.ini; overlay geometry/style updated");
         }
+    }
+    if let Some(sys) = SYS.get() {
+        sys.want_gpu.store(state.settings.show_gpu, Ordering::Relaxed);
+        state.values.cpu = stat_value(sys.cpu.load(Ordering::Relaxed));
+        state.values.ram = stat_value(sys.ram.load(Ordering::Relaxed));
+        state.values.gpu = stat_value(sys.gpu.load(Ordering::Relaxed));
     }
     let should_capture = foreground_name.as_deref().filter(|n| !is_system_or_shell_process(n));
 
@@ -856,9 +1232,7 @@ fn update_overlay(hwnd: HWND) {
             // Clear the exited child handle but keep the target identity, so we do not
             // repeatedly respawn or flood the diagnostic log every 250 ms.
             state.capture = None;
-            state.fps_text = "FPS ERR".to_string();
-            state.frametime_text = "-- ms".to_string();
-            state.low1_text = "1% low --".to_string();
+            state.clear_capture_values("ERR");
         } else {
             // Only show a reading while frame samples are recent, so a stopped
             // game or a hung PresentMon process does not leave a stale FPS forever.
@@ -871,13 +1245,12 @@ fn update_overlay(hwnd: HWND) {
             if let Some((fps, frametime_x100, low1, last_sample)) = sample {
                 let now = epoch_millis();
                 if fps > 0 && last_sample > 0 && now.saturating_sub(last_sample) < 5000 {
-                    state.fps_text = format!("{} FPS", fps);
-                    state.frametime_text = format!("{:.1} ms", frametime_x100 as f64 / 100.0);
-                    state.low1_text = if low1 > 0 { format!("1% low {}", low1) } else { "1% low --".to_string() };
+                    state.values.fps = Some(fps);
+                    state.values.frametime_ms = Some(frametime_x100 as f64 / 100.0);
+                    state.values.low1 = if low1 > 0 { Some(low1) } else { None };
+                    state.fps_note = "";
                 } else {
-                    state.fps_text = "FPS ...".to_string();
-                    state.frametime_text = "-- ms".to_string();
-                    state.low1_text = "1% low --".to_string();
+                    state.clear_capture_values("...");
                 }
             }
         }
@@ -905,21 +1278,24 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lpa
             let mut ps: PAINTSTRUCT = zeroed();
             let hdc = BeginPaint(hwnd, &mut ps);
             if !hdc.is_null() {
-                let (lines, settings) = APP.get().and_then(|m| m.lock().ok())
-                    .map(|s| (
-                        overlay_lines(&s.settings, &s.fps_text, &s.frametime_text, &s.low1_text),
-                        s.settings.clone(),
-                    ))
-                    .unwrap_or_else(|| (vec!["-- FPS".to_string()], OverlaySettings::default()));
-                let font = make_overlay_font(settings.font_size);
+                let (texts, samples, settings) = APP.get().and_then(|m| m.lock().ok())
+                    .map(|s| {
+                        let metrics = s.settings.metrics();
+                        let texts: Vec<String> = metrics.iter()
+                            .map(|m| format_metric(*m, &s.values, s.fps_note, s.settings.show_labels))
+                            .collect();
+                        let samples: Vec<&'static str> = metrics.iter()
+                            .map(|m| m.sample(s.settings.show_labels))
+                            .collect();
+                        (texts, samples, s.settings.clone())
+                    })
+                    .unwrap_or_else(|| (vec!["-- FPS".to_string()], vec!["1000 FPS"], OverlaySettings::default()));
+                let font = make_overlay_font(&settings);
                 let previous = if !font.is_null() { SelectObject(hdc, font) } else { std::ptr::null_mut() };
                 SetBkMode(hdc, 1); // transparent text background
-                SetTextColor(hdc, settings.color_ref());
 
-                // Align the text inside the window according to the chosen anchor.
-                // With a right anchor the text hugs the right edge, so it can reach
-                // the very edge of the monitor; "FPS" values of different widths
-                // (60 vs 144 vs 1000) also keep their anchored edge steady.
+                // Text is aligned by the chosen anchor, so a right-anchored overlay
+                // hugs the right edge of the monitor.
                 let mut client: RECT = zeroed();
                 GetClientRect(hwnd, &mut client);
                 let align = match settings.horizontal_anchor {
@@ -927,25 +1303,40 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lpa
                     2 => DT_RIGHT,
                     _ => DT_LEFT,
                 };
-                // Same line height rule as measure_overlay_lines, so the window
-                // height computed from it always fits the painted lines.
-                let probe = wide("Ag");
-                let mut probe_size = SIZE { cx: 0, cy: 0 };
-                GetTextExtentPoint32W(hdc, probe.as_ptr(), 2, &mut probe_size);
-                let line_h = probe_size.cy.max(settings.font_size);
-                for (index, line) in lines.iter().enumerate() {
-                    let text_w = wide(line);
-                    let top = OVERLAY_PAD_Y + index as i32 * (line_h + OVERLAY_LINE_GAP);
-                    let mut rc = RECT {
-                        left: client.left + OVERLAY_PAD_X,
-                        top,
-                        right: client.right - OVERLAY_PAD_X,
-                        bottom: top + line_h,
+                // Same measuring rules as window_size, so the lines always fit the window.
+                let line_h = text_extent(hdc, "Ag").cy.max(settings.font_size);
+                let shadow_off = if settings.shadow { settings.shadow_offset() } else { 0 };
+                // Row layout: each item gets a fixed cell sized for its widest value,
+                // so items do not jump around when a number gains a digit.
+                let cell_widths: Vec<i32> = samples.iter().map(|s| text_extent(hdc, s).cx).collect();
+                let row_total: i32 = cell_widths.iter().sum::<i32>()
+                    + settings.item_gap * (cell_widths.len() as i32 - 1).max(0);
+                let mut x_cursor = match settings.horizontal_anchor {
+                    1 => client.left + ((client.right - client.left) - row_total) / 2,
+                    2 => client.right - OVERLAY_PAD_X - shadow_off - row_total,
+                    _ => client.left + OVERLAY_PAD_X,
+                };
+                for (index, line) in texts.iter().enumerate() {
+                    let mut rc = if settings.layout == 1 {
+                        let cell_w = cell_widths.get(index).copied().unwrap_or(0);
+                        let cell = RECT {
+                            left: x_cursor,
+                            top: OVERLAY_PAD_Y,
+                            right: x_cursor + cell_w,
+                            bottom: OVERLAY_PAD_Y + line_h,
+                        };
+                        x_cursor += cell_w + settings.item_gap;
+                        cell
+                    } else {
+                        let top = OVERLAY_PAD_Y + index as i32 * (line_h + settings.line_gap);
+                        RECT {
+                            left: client.left + OVERLAY_PAD_X,
+                            top,
+                            right: client.right - OVERLAY_PAD_X - shadow_off,
+                            bottom: top + line_h,
+                        }
                     };
-                    DrawTextW(
-                        hdc, text_w.as_ptr(), text_w.len().saturating_sub(1) as i32, &mut rc,
-                        align | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP,
-                    );
+                    draw_overlay_text(hdc, line, &mut rc, align, &settings);
                 }
 
                 if !previous.is_null() { SelectObject(hdc, previous); }
@@ -1145,6 +1536,43 @@ fn key_hint(ui: &mut egui::Ui, key: &str, action: &str) {
         });
 }
 
+// A selectable pill, used for single-choice options such as layout and font.
+fn chip(ui: &mut egui::Ui, label: &str, selected: bool, min_width: f32) -> egui::Response {
+    let font = egui::FontId::proportional(12.5);
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), C_TEXT);
+    let width = (galley.size().x + 26.0).max(min_width);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 32.0), egui::Sense::click());
+    let ctx = ui.ctx().clone();
+    let hov = ctx.animate_bool_with_time(response.id.with("hov"), response.hovered(), 0.12);
+    let sel = ctx.animate_bool_with_time(response.id.with("sel"), selected, 0.18);
+    // Selected chips are light, so their label switches to the dark on-accent color.
+    let fill = mix(mix(C_SURFACE, C_RAISED, hov), C_ACCENT, sel);
+    let border = mix(mix(C_BORDER, C_BORDER_HI, hov), C_ACCENT, sel);
+    let text = mix(mix(C_MUTED, C_TEXT, hov), C_ON_ACCENT, sel);
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, egui::CornerRadius::same(9), fill);
+    painter.rect_stroke(rect, egui::CornerRadius::same(9), egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+    painter.text(rect.center(), egui::Align2::CENTER_CENTER, label, font, text);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+// Size of a block of galleys laid out as a column or as a row.
+fn block_size<G: std::ops::Deref<Target = egui::Galley>>(galleys: &[G], row: bool, line_gap: f32, item_gap: f32) -> egui::Vec2 {
+    let gaps = galleys.len().saturating_sub(1) as f32;
+    if row {
+        egui::vec2(
+            galleys.iter().map(|g| g.size().x).sum::<f32>() + item_gap * gaps,
+            galleys.iter().map(|g| g.size().y).fold(0.0_f32, f32::max),
+        )
+    } else {
+        egui::vec2(
+            galleys.iter().map(|g| g.size().x).fold(0.0_f32, f32::max),
+            galleys.iter().map(|g| g.size().y).sum::<f32>() + line_gap * gaps,
+        )
+    }
+}
+
 fn toggle_row(ui: &mut egui::Ui, title: &str, subtitle: &str, value: &mut bool) {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), egui::Sense::click());
     if response.clicked() { *value = !*value; }
@@ -1284,30 +1712,50 @@ impl SettingsApp {
     }
 
     fn draw_preview_panel(&mut self, ui: &mut egui::Ui) {
-        card_title(ui, "Preview", "Illustrative — the FPS value is a placeholder.");
+        card_title(ui, "Preview", "Illustrative values. The real font is applied on the overlay.");
         ui.add_space(12.0);
 
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(260.0), 160.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(260.0), 150.0), egui::Sense::hover());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, egui::CornerRadius::same(10), C_DEEP);
+        // A mid-dark backdrop, so both the text and its shadow are visible.
+        painter.rect_filled(rect, egui::CornerRadius::same(10), egui::Color32::from_rgb(30, 32, 36));
         painter.rect_stroke(rect, egui::CornerRadius::same(10), egui::Stroke::new(1.0, C_BORDER), egui::StrokeKind::Inside);
 
-        let font = egui::FontId::proportional((self.settings.font_size as f32 * 0.48).clamp(12.0, 30.0));
+        let scale = 0.48_f32;
         let color = color_from_hex(&self.settings.color_hex);
-        let mut preview_lines: Vec<&str> = Vec::new();
-        if self.settings.show_fps { preview_lines.push("144 FPS"); }
-        if self.settings.show_frametime { preview_lines.push("6.9 ms"); }
-        if self.settings.show_low1 { preview_lines.push("1% low 98"); }
-        if preview_lines.is_empty() { preview_lines.push("144 FPS"); }
-        let galleys: Vec<_> = preview_lines
-            .iter()
-            .map(|text| painter.layout_no_wrap(text.to_string(), font.clone(), color))
+        let shadow_color = egui::Color32::from_rgb(10, 10, 10);
+        let sample = MetricValues {
+            fps: Some(144),
+            frametime_ms: Some(6.9),
+            low1: Some(98),
+            cpu: Some(23),
+            ram: Some(54),
+            gpu: Some(41),
+        };
+        let texts: Vec<String> = self.settings.metrics().iter()
+            .map(|m| format_metric(*m, &sample, "", self.settings.show_labels))
             .collect();
-        let line_gap = 2.0;
-        let block_w = galleys.iter().map(|g| g.size().x).fold(0.0_f32, f32::max);
-        let block_h = galleys.iter().map(|g| g.size().y).sum::<f32>()
-            + line_gap * galleys.len().saturating_sub(1) as f32;
-        let size = egui::vec2(block_w, block_h);
+        let row = self.settings.layout == 1;
+        let line_gap = self.settings.line_gap as f32 * scale;
+        let item_gap = self.settings.item_gap as f32 * scale;
+
+        let layout = |px: f32, tint: egui::Color32| {
+            texts.iter()
+                .map(|t| painter.layout_no_wrap(t.clone(), egui::FontId::proportional(px), tint))
+                .collect::<Vec<_>>()
+        };
+        let mut px = (self.settings.font_size as f32 * scale).clamp(11.0, 30.0);
+        let mut galleys = layout(px, color);
+        let mut size = block_size(&galleys, row, line_gap, item_gap);
+        // Long rows shrink to fit the preview instead of running off its edge.
+        let available = rect.width() - 24.0;
+        if size.x > available && size.x > 0.0 {
+            px = (px * available / size.x).max(8.0);
+            galleys = layout(px, color);
+            size = block_size(&galleys, row, line_gap, item_gap);
+        }
+        let shadow_galleys = if self.settings.shadow { layout(px, shadow_color) } else { Vec::new() };
+        let shadow_px = (self.settings.shadow_offset() as f32 * scale * 1.6).max(1.0);
 
         let margin = 10.0;
         let sx = rect.width() / 1920.0;
@@ -1333,22 +1781,33 @@ impl SettingsApp {
         let ctx = ui.ctx().clone();
         let x = ctx.animate_value_with_time(egui::Id::new("preview-x"), target_x, 0.22);
         let y = ctx.animate_value_with_time(egui::Id::new("preview-y"), target_y, 0.22);
+
+        let mut cursor_x = x;
         let mut cursor_y = y;
-        for galley in galleys {
-            let line_w = galley.size().x;
-            let line_h = galley.size().y;
-            let line_x = match self.settings.horizontal_anchor {
-                0 => 0.0,
-                1 => (block_w - line_w) / 2.0,
-                _ => block_w - line_w,
+        for (index, galley) in galleys.into_iter().enumerate() {
+            let item_w = galley.size().x;
+            let item_h = galley.size().y;
+            let pos = if row {
+                egui::pos2(cursor_x, y + (size.y - item_h) / 2.0)
+            } else {
+                let line_x = match self.settings.horizontal_anchor {
+                    0 => 0.0,
+                    1 => (size.x - item_w) / 2.0,
+                    _ => size.x - item_w,
+                };
+                egui::pos2(x + line_x, cursor_y)
             };
-            painter.galley(egui::pos2(x + line_x, cursor_y), galley, color);
-            cursor_y += line_h + line_gap;
+            if let Some(shadow) = shadow_galleys.get(index) {
+                painter.galley(pos + egui::vec2(shadow_px, shadow_px), shadow.clone(), shadow_color);
+            }
+            painter.galley(pos, galley, color);
+            cursor_x += item_w + item_gap;
+            cursor_y += item_h + line_gap;
         }
     }
 
     fn draw_appearance_panel(&mut self, ui: &mut egui::Ui) {
-        card_title(ui, "Appearance", "Size and color of the FPS counter.");
+        card_title(ui, "Appearance", "Font, size and color of the overlay text.");
         ui.add_space(12.0);
 
         ui.horizontal(|ui| {
@@ -1359,6 +1818,17 @@ impl SettingsApp {
         });
         ui.spacing_mut().slider_width = (ui.available_width() - 6.0).max(120.0);
         ui.add(egui::Slider::new(&mut self.settings.font_size, 18..=64).show_value(false));
+
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("FONT").size(10.5).strong().color(C_MUTED));
+        ui.horizontal_wrapped(|ui| {
+            for family in FONT_FAMILIES {
+                if chip(ui, family, self.settings.font_family == family, 0.0).clicked() {
+                    self.settings.font_family = family.to_string();
+                }
+            }
+        });
+        ui.label(egui::RichText::new("Must be installed on this PC. Consolas keeps digits evenly spaced.").size(11.5).color(C_MUTED));
 
         ui.add_space(8.0);
         ui.label(egui::RichText::new("COLOR").size(10.5).strong().color(C_MUTED));
@@ -1395,18 +1865,53 @@ impl SettingsApp {
             }
         });
         ui.label(egui::RichText::new("RRGGBB. Pure black is transparent.").size(11.5).color(C_MUTED));
+
+        ui.add_space(6.0);
+        toggle_row(ui, "Bold text", "Heavier weight reads better over busy scenes", &mut self.settings.bold);
+        toggle_row(ui, "Text shadow", "A soft dark shadow behind the text", &mut self.settings.shadow);
     }
 
     fn draw_display_panel(&mut self, ui: &mut egui::Ui) {
-        card_title(ui, "Overlay lines", "Choose what is shown, one item per line.");
+        card_title(ui, "Overlay items", "Switch each reading on or off.");
         ui.add_space(8.0);
         toggle_row(ui, "FPS", "Average of the last 30 frames", &mut self.settings.show_fps);
         toggle_row(ui, "Frametime", "Milliseconds per frame", &mut self.settings.show_frametime);
         toggle_row(ui, "1% low", "Slowest 1% of the last ~600 frames", &mut self.settings.show_low1);
-        // At least one line must stay on; a toggle that would turn all off snaps back.
-        if !self.settings.show_fps && !self.settings.show_frametime && !self.settings.show_low1 {
+        toggle_row(ui, "CPU usage", "Total processor load", &mut self.settings.show_cpu);
+        toggle_row(ui, "RAM usage", "Physical memory in use", &mut self.settings.show_ram);
+        toggle_row(ui, "GPU usage", "Busiest GPU engine, from Windows counters", &mut self.settings.show_gpu);
+        // At least one item must stay on; a toggle that would turn all off snaps back.
+        if ALL_METRICS.iter().all(|m| !self.settings.is_enabled(*m)) {
             self.settings.show_fps = true;
         }
+    }
+
+    fn draw_layout_panel(&mut self, ui: &mut egui::Ui) {
+        card_title(ui, "Layout", "Stack items in a column or line them up in a row.");
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if chip(ui, "Column", self.settings.layout == 0, 104.0).clicked() { self.settings.layout = 0; }
+            if chip(ui, "Row", self.settings.layout == 1, 104.0).clicked() { self.settings.layout = 1; }
+        });
+
+        ui.add_space(6.0);
+        let row = self.settings.layout == 1;
+        let (label, spacing, max) = if row {
+            ("Item spacing", &mut self.settings.item_gap, 60_i32)
+        } else {
+            ("Line spacing", &mut self.settings.line_gap, 40_i32)
+        };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(label).color(C_TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(format!("{} px", *spacing)).strong().color(C_TEXT));
+            });
+        });
+        ui.spacing_mut().slider_width = (ui.available_width() - 6.0).max(120.0);
+        ui.add(egui::Slider::new(spacing, 0..=max).show_value(false));
+
+        ui.add_space(6.0);
+        toggle_row(ui, "Show labels", "\"CPU 23%\" instead of just \"23%\"", &mut self.settings.show_labels);
     }
 
     fn reset_defaults(&mut self) {
@@ -1426,7 +1931,7 @@ impl eframe::App for SettingsApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Zoro FPS Overlay").size(18.0).strong().color(C_TEXT));
-                    ui.label(egui::RichText::new("v0.4.0").size(11.0).color(C_MUTED));
+                    ui.label(egui::RichText::new("v0.5.0").size(11.0).color(C_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         key_hint(ui, "F10", "Quit");
                         ui.add_space(8.0);
@@ -1469,8 +1974,11 @@ impl eframe::App for SettingsApp {
                         ui.add_space(8.0);
                         card(ui, |ui| self.draw_display_panel(ui));
                     });
+                    // The preview stays pinned while the settings below it scroll.
+                    card(&mut columns[1], |ui| self.draw_preview_panel(ui));
+                    columns[1].add_space(8.0);
                     egui::ScrollArea::vertical().id_salt("scroll-right").auto_shrink([false, false]).show(&mut columns[1], |ui| {
-                        card(ui, |ui| self.draw_preview_panel(ui));
+                        card(ui, |ui| self.draw_layout_panel(ui));
                         ui.add_space(8.0);
                         card(ui, |ui| self.draw_appearance_panel(ui));
                     });
@@ -1539,6 +2047,7 @@ fn run_overlay() {
     cleanup_stale_session_from_previous_run(&presentmon_path, &diagnostic_path, own_pid);
     let _ = fs::write(&diagnostic_path, "");
     let _ = fs::write(&presentmon_output_path, "");
+    let sys_log_path = diagnostic_path.clone();
     let _ = APP.set(Mutex::new(AppState {
         own_pid,
         presentmon_path,
@@ -1548,14 +2057,18 @@ fn run_overlay() {
         settings: settings.clone(),
         last_settings_check: Instant::now(),
         capture: None,
-        fps_text: "-- FPS".to_string(),
-        frametime_text: "-- ms".to_string(),
-        low1_text: "1% low --".to_string(),
+        values: MetricValues::default(),
+        fps_note: "",
         visible: false,
         target_name: None,
         target_pid: None,
         user_hidden: false,
     }));
+
+    let sys_stats = Arc::new(SysStats::new());
+    sys_stats.want_gpu.store(settings.show_gpu, Ordering::Relaxed);
+    let _ = SYS.set(Arc::clone(&sys_stats));
+    spawn_system_stats_thread(sys_stats, sys_log_path);
 
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
