@@ -66,6 +66,19 @@ const PDH_MORE_DATA: u32 = 0x8000_07D2;
 // Marks "no reading available" in the shared system stats.
 const STAT_NONE: u32 = u32::MAX;
 
+// How long PresentMon keeps measuring an app after it loses focus, so a brief alt-tab or a
+// notification does not restart the measurement.
+const CAPTURE_GRACE: Duration = Duration::from_secs(8);
+// A newly focused app must stay in front this long before PresentMon is started for it.
+const FOREGROUND_DWELL: Duration = Duration::from_millis(700);
+// "Games only": frames must arrive at this rate, for this long, before the overlay appears...
+const AUTO_MIN_FPS: u32 = 10;
+const AUTO_SHOW_AFTER: Duration = Duration::from_millis(1200);
+// ...and once it is showing, it stays until frames have been missing this long.
+const AUTO_HIDE_AFTER: Duration = Duration::from_secs(5);
+const MAX_APP_RULES: usize = 64;
+const RECENT_APPS_MAX: usize = 12;
+
 // Win32 aliases and structures. Using raw FFI keeps this project dependency-free.
 type BOOL = i32;
 type BYTE = u8;
@@ -325,6 +338,11 @@ struct OverlaySettings {
     bold: bool,
     shadow: bool,
     font_family: String,
+    // 0 = only apps that render frames like a game, 1 = every app in front.
+    visibility: u8,
+    // Process names (lowercase, e.g. "game.exe") that always / never get the overlay.
+    always_apps: Vec<String>,
+    never_apps: Vec<String>,
 }
 
 impl Default for OverlaySettings {
@@ -349,6 +367,9 @@ impl Default for OverlaySettings {
             bold: true,
             shadow: false,
             font_family: "Segoe UI".to_string(),
+            visibility: 0,
+            always_apps: Vec::new(),
+            never_apps: Vec::new(),
         }
     }
 }
@@ -422,6 +443,12 @@ impl OverlaySettings {
             .find(|f| f.eq_ignore_ascii_case(self.font_family.trim()))
             .unwrap_or(&FONT_FAMILIES[0])
             .to_string();
+        self.visibility = self.visibility.min(1);
+        self.always_apps = clean_app_list(&self.always_apps);
+        self.never_apps = clean_app_list(&self.never_apps);
+        // A Hide rule wins if a name ended up in both lists.
+        let never = self.never_apps.clone();
+        self.always_apps.retain(|a| !never.contains(a));
         // The overlay always shows at least one item.
         if ALL_METRICS.iter().all(|m| !self.is_enabled(*m)) {
             self.show_fps = true;
@@ -481,6 +508,86 @@ fn measure_overlay_lines(settings: &OverlaySettings, samples: &[&str]) -> (i32, 
     }
 }
 
+// Lowercase process name such as "game.exe". Accepts a pasted path and adds ".exe" when
+// the name has no extension. Rejects characters that would break the settings file.
+fn normalize_app_name(value: &str) -> Option<String> {
+    let leaf = value.trim().trim_matches('"').rsplit(['\\', '/']).next()?.trim().to_ascii_lowercase();
+    if leaf.is_empty() || leaf.len() > 64 { return None; }
+    if leaf.chars().any(|c| c.is_control() || matches!(c, ',' | '=' | '"' | '<' | '>' | '|' | '*' | '?' | ':')) {
+        return None;
+    }
+    if leaf.contains('.') { Some(leaf) } else { Some(format!("{}.exe", leaf)) }
+}
+
+fn clean_app_list(list: &[String]) -> Vec<String> {
+    let mut cleaned: Vec<String> = Vec::new();
+    for item in list {
+        if let Some(name) = normalize_app_name(item) {
+            if !cleaned.contains(&name) && cleaned.len() < MAX_APP_RULES {
+                cleaned.push(name);
+            }
+        }
+    }
+    cleaned
+}
+
+fn app_list_contains(list: &[String], name: &str) -> bool {
+    list.iter().any(|a| a.eq_ignore_ascii_case(name))
+}
+
+// Everyday programs that draw frames but are not games: browsers, media players, chat apps,
+// editors, terminals, office tools and game launchers. "Games only" mode skips them, and a
+// Show rule in the settings overrides this list.
+fn is_known_non_game(name: &str) -> bool {
+    const NON_GAMES: &[&str] = &[
+        "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe",
+        "iexplore.exe", "arc.exe", "msedgewebview2.exe",
+        "vlc.exe", "mpv.exe", "mpc-hc.exe", "mpc-hc64.exe", "mpc-be.exe", "mpc-be64.exe",
+        "potplayer.exe", "potplayermini.exe", "potplayermini64.exe", "wmplayer.exe", "spotify.exe",
+        "discord.exe", "telegram.exe", "slack.exe", "teams.exe", "ms-teams.exe", "whatsapp.exe",
+        "zoom.exe", "skype.exe",
+        "code.exe", "cursor.exe", "devenv.exe", "idea64.exe", "pycharm64.exe", "rider64.exe",
+        "clion64.exe", "webstorm64.exe", "notepad++.exe", "sublime_text.exe",
+        "windowsterminal.exe", "wt.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "conhost.exe",
+        "notepad.exe", "mspaint.exe", "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe",
+        "onenote.exe", "acrobat.exe", "acrord32.exe", "obs64.exe",
+        "steam.exe", "epicgameslauncher.exe", "galaxyclient.exe", "battle.net.exe", "origin.exe",
+        "eadesktop.exe", "ubisoftconnect.exe", "upc.exe",
+    ];
+    NON_GAMES.iter().any(|x| name.eq_ignore_ascii_case(x))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppClass {
+    // Never gets the overlay.
+    Never,
+    // Always gets the overlay while in front.
+    Always,
+    // Gets it according to the visibility mode.
+    Candidate,
+}
+
+fn classify_app(settings: &OverlaySettings, name: &str) -> AppClass {
+    if app_list_contains(&settings.never_apps, name) { return AppClass::Never; }
+    if app_list_contains(&settings.always_apps, name) { return AppClass::Always; }
+    if settings.visibility == 0 && is_known_non_game(name) { return AppClass::Never; }
+    AppClass::Candidate
+}
+
+// Apps the overlay has seen rendering frames, newest first. The settings window reads this
+// file to offer them as a list, so nobody has to type process names.
+fn recent_apps_path() -> PathBuf {
+    settings_file_path().with_file_name("recent_apps.txt")
+}
+
+fn load_recent_apps(path: &PathBuf) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(path) else { return Vec::new(); };
+    let lines: Vec<String> = contents.lines().map(str::to_string).collect();
+    let mut apps = clean_app_list(&lines);
+    apps.truncate(RECENT_APPS_MAX);
+    apps
+}
+
 fn normalize_color(value: &str) -> Option<String> {
     let clean = value.trim().trim_start_matches('#');
     if clean.len() != 6 || !clean.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -527,6 +634,9 @@ fn load_settings(path: &PathBuf) -> OverlaySettings {
             "bold" => result.bold = value == "1",
             "shadow" => result.shadow = value == "1",
             "font_family" => result.font_family = value.to_string(),
+            "visibility" => if let Ok(v) = value.parse::<u8>() { result.visibility = v; },
+            "always_apps" => result.always_apps = value.split(',').map(str::to_string).collect(),
+            "never_apps" => result.never_apps = value.split(',').map(str::to_string).collect(),
             _ => {},
         }
     }
@@ -541,14 +651,16 @@ fn save_settings(path: &PathBuf, settings: &OverlaySettings) -> Result<(), Strin
     let content = format!(
         "horizontal_anchor={}\nvertical_anchor={}\noffset_x={}\noffset_y={}\nfont_size={}\ncolor={}\n\
          show_fps={}\nshow_frametime={}\nshow_low1={}\nshow_cpu={}\nshow_ram={}\nshow_gpu={}\n\
-         layout={}\nline_gap={}\nitem_gap={}\nshow_labels={}\nbold={}\nshadow={}\nfont_family={}\n",
+         layout={}\nline_gap={}\nitem_gap={}\nshow_labels={}\nbold={}\nshadow={}\nfont_family={}\n\
+         visibility={}\nalways_apps={}\nnever_apps={}\n",
         settings.horizontal_anchor, settings.vertical_anchor, settings.offset_x,
         settings.offset_y, settings.font_size, settings.color_hex,
         settings.show_fps as u8, settings.show_frametime as u8, settings.show_low1 as u8,
         settings.show_cpu as u8, settings.show_ram as u8, settings.show_gpu as u8,
         settings.layout, settings.line_gap, settings.item_gap,
         settings.show_labels as u8, settings.bold as u8, settings.shadow as u8,
-        settings.font_family
+        settings.font_family, settings.visibility,
+        settings.always_apps.join(","), settings.never_apps.join(",")
     );
     fs::write(path, content).map_err(|e| format!("Couldn't save settings: {}", e))
 }
@@ -592,11 +704,35 @@ struct AppState {
     target_name: Option<String>,
     target_pid: Option<u32>,
     user_hidden: bool,
+    // Whether the rules want the overlay visible right now (before the F8 override).
+    wanted: bool,
+    // The app that has been in front, with its pid and since when.
+    foreground_seen: Option<(String, u32, Instant)>,
+    capture_last_focus: Instant,
+    // "Games only" tracking for the measured app.
+    rate_since: Option<Instant>,
+    confirmed: bool,
+    last_flowing: Option<Instant>,
+    recorded_current: bool,
+    recent_apps: Vec<String>,
+    recent_path: PathBuf,
 }
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
 
 impl AppState {
+    // Puts an app at the top of the recently seen list that the settings window shows.
+    fn remember_recent_app(&mut self, name: &str) {
+        let Some(name) = normalize_app_name(name) else { return; };
+        self.recent_apps.retain(|a| *a != name);
+        self.recent_apps.insert(0, name);
+        self.recent_apps.truncate(RECENT_APPS_MAX);
+        if let Some(parent) = self.recent_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&self.recent_path, self.recent_apps.join("\n"));
+    }
+
     // Forgets the PresentMon readings (system readings are kept).
     fn clear_capture_values(&mut self, note: &'static str) {
         self.values.fps = None;
@@ -782,6 +918,11 @@ fn start_capture(state: &mut AppState, process_name: &str, process_id: u32) {
     stop_capture(state);
     state.target_name = Some(process_name.to_string());
     state.target_pid = Some(process_id);
+    state.rate_since = None;
+    state.confirmed = false;
+    state.last_flowing = None;
+    state.recorded_current = false;
+    state.capture_last_focus = Instant::now();
 
     log_event(&state.diagnostic_path, &format!(
         "Starting capture: process={} pid={} presentmon={}",
@@ -1208,65 +1349,120 @@ fn update_overlay(hwnd: HWND) {
         state.values.ram = stat_value(sys.ram.load(Ordering::Relaxed));
         state.values.gpu = stat_value(sys.gpu.load(Ordering::Relaxed));
     }
-    let should_capture = foreground_name.as_deref().filter(|n| !is_system_or_shell_process(n));
+    let now = Instant::now();
+    // The app in front, unless it is the desktop, a system window or this program.
+    let foreground = foreground_name.as_deref().filter(|n| !is_system_or_shell_process(n));
+    let class = foreground.map(|n| classify_app(&state.settings, n));
+    let measurable = matches!(class, Some(AppClass::Always) | Some(AppClass::Candidate));
 
-    if let Some(name) = should_capture {
-        let needs_new_capture = state.target_name.as_deref() != Some(name)
-            || state.target_pid != Some(pid);
-        if needs_new_capture { start_capture(&mut state, name, pid); }
-
-        let mut exited_message: Option<String> = None;
-        if let Some(capture) = state.capture.as_mut() {
-            match capture.child.try_wait() {
-                Ok(Some(status)) => {
-                    exited_message = Some(format!("PresentMon exited with status {}; target={} pid={}", status, capture.process_name, capture.process_id));
-                }
-                Err(e) => {
-                    exited_message = Some(format!("ERROR: failed waiting for PresentMon: {}", e));
-                }
-                Ok(None) => {}
+    // A new app must stay in front briefly before it is measured, so alt-tabbing through
+    // windows or short-lived helper windows do not restart PresentMon over and over.
+    let mut settled = false;
+    match foreground {
+        Some(name) if measurable => {
+            let same = matches!(&state.foreground_seen, Some((n, p, _)) if n == name && *p == pid);
+            if !same { state.foreground_seen = Some((name.to_string(), pid, now)); }
+            let since = state.foreground_seen.as_ref().map(|(_, _, t)| *t).unwrap_or(now);
+            let already_target = state.target_name.as_deref() == Some(name) && state.target_pid == Some(pid);
+            settled = already_target || now.duration_since(since) >= FOREGROUND_DWELL;
+            if settled {
+                if !already_target { start_capture(&mut state, name, pid); }
+                state.capture_last_focus = now;
             }
         }
-        if let Some(message) = exited_message {
-            log_event(&state.diagnostic_path, &message);
-            // Clear the exited child handle but keep the target identity, so we do not
-            // repeatedly respawn or flood the diagnostic log every 250 ms.
-            state.capture = None;
-            state.clear_capture_values("ERR");
-        } else {
-            // Only show a reading while frame samples are recent, so a stopped
-            // game or a hung PresentMon process does not leave a stale FPS forever.
-            let sample = state.capture.as_ref().map(|capture| (
-                capture.stats.fps.load(Ordering::Relaxed),
-                capture.stats.frametime_x100.load(Ordering::Relaxed),
-                capture.stats.low1_fps.load(Ordering::Relaxed),
-                capture.stats.last_sample_ms.load(Ordering::Relaxed),
-            ));
-            if let Some((fps, frametime_x100, low1, last_sample)) = sample {
-                let now = epoch_millis();
-                if fps > 0 && last_sample > 0 && now.saturating_sub(last_sample) < 5000 {
-                    state.values.fps = Some(fps);
-                    state.values.frametime_ms = Some(frametime_x100 as f64 / 100.0);
-                    state.values.low1 = if low1 > 0 { Some(low1) } else { None };
-                    state.fps_note = "";
-                } else {
-                    state.clear_capture_values("...");
-                }
+        _ => { state.foreground_seen = None; }
+    }
+
+    // Keep measuring for a while after focus moves elsewhere, then stop.
+    let capture_exists = state.capture.is_some() || state.target_name.is_some();
+    if capture_exists && !settled && now.duration_since(state.capture_last_focus) > CAPTURE_GRACE {
+        stop_capture(&mut state);
+    }
+
+    let mut exited_message: Option<String> = None;
+    if let Some(capture) = state.capture.as_mut() {
+        match capture.child.try_wait() {
+            Ok(Some(status)) => {
+                exited_message = Some(format!("PresentMon exited with status {}; target={} pid={}", status, capture.process_name, capture.process_id));
             }
+            Err(e) => {
+                exited_message = Some(format!("ERROR: failed waiting for PresentMon: {}", e));
+            }
+            Ok(None) => {}
         }
-        if !state.user_hidden && !state.visible {
-            unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE); }
-            state.visible = true;
-        } else if state.user_hidden && state.visible {
-            unsafe { ShowWindow(hwnd, SW_HIDE); }
-            state.visible = false;
-        }
+    }
+    if let Some(message) = exited_message {
+        log_event(&state.diagnostic_path, &message);
+        // Clear the exited child handle but keep the target identity, so we do not
+        // repeatedly respawn or flood the diagnostic log every 250 ms.
+        state.capture = None;
+        state.clear_capture_values("ERR");
     } else {
-        if state.capture.is_some() || state.target_name.is_some() { stop_capture(&mut state); }
-        if state.visible {
-            unsafe { ShowWindow(hwnd, SW_HIDE); }
-            state.visible = false;
+        // Only show a reading while frame samples are recent, so a stopped
+        // game or a hung PresentMon process does not leave a stale FPS forever.
+        let sample = state.capture.as_ref().map(|capture| (
+            capture.stats.fps.load(Ordering::Relaxed),
+            capture.stats.frametime_x100.load(Ordering::Relaxed),
+            capture.stats.low1_fps.load(Ordering::Relaxed),
+            capture.stats.last_sample_ms.load(Ordering::Relaxed),
+        ));
+        if let Some((fps, frametime_x100, low1, last_sample)) = sample {
+            let now_ms = epoch_millis();
+            if fps > 0 && last_sample > 0 && now_ms.saturating_sub(last_sample) < 5000 {
+                state.values.fps = Some(fps);
+                state.values.frametime_ms = Some(frametime_x100 as f64 / 100.0);
+                state.values.low1 = if low1 > 0 { Some(low1) } else { None };
+                state.fps_note = "";
+            } else {
+                state.clear_capture_values("...");
+            }
         }
+    }
+
+    // "Games only": is the app in front rendering frames steadily, like a game? Once that has
+    // held for a moment it is confirmed, and it stays confirmed until frames stop for a while,
+    // so a loading screen or a low-FPS scene never hides the overlay.
+    if settled {
+        let flow = state.capture.as_ref().map(|capture| (
+            capture.stats.fps.load(Ordering::Relaxed),
+            epoch_millis().saturating_sub(capture.stats.last_sample_ms.load(Ordering::Relaxed)),
+            capture.stats.last_sample_ms.load(Ordering::Relaxed),
+        ));
+        let (fps, age_ms, last_sample) = flow.unwrap_or((0, u64::MAX, 0));
+        let flowing = fps > 0 && last_sample > 0 && age_ms < 4000;
+        let game_rate = flowing && fps >= AUTO_MIN_FPS && age_ms < 1500;
+        if flowing { state.last_flowing = Some(now); }
+        if state.confirmed {
+            let quiet = state.last_flowing.map_or(true, |t| now.duration_since(t) > AUTO_HIDE_AFTER);
+            if quiet {
+                state.confirmed = false;
+                state.rate_since = None;
+            }
+        } else if game_rate {
+            let start = *state.rate_since.get_or_insert(now);
+            if now.duration_since(start) >= AUTO_SHOW_AFTER { state.confirmed = true; }
+        } else {
+            state.rate_since = None;
+        }
+        if state.confirmed && !state.recorded_current {
+            state.recorded_current = true;
+            if let Some(name) = foreground { state.remember_recent_app(name); }
+        }
+    }
+
+    let wanted = match class {
+        None | Some(AppClass::Never) => false,
+        Some(AppClass::Always) => settled,
+        Some(AppClass::Candidate) => settled && (state.settings.visibility == 1 || state.confirmed),
+    };
+    state.wanted = wanted;
+    let show = wanted && !state.user_hidden;
+    if show && !state.visible {
+        unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE); }
+        state.visible = true;
+    } else if !show && state.visible {
+        unsafe { ShowWindow(hwnd, SW_HIDE); }
+        state.visible = false;
     }
     drop(state);
     unsafe { InvalidateRect(hwnd, std::ptr::null(), 1); }
@@ -1352,7 +1548,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lpa
                 if let Some(m) = APP.get() {
                     if let Ok(mut state) = m.lock() {
                         state.user_hidden = !state.user_hidden;
-                        state.visible = !state.user_hidden;
+                        // Hiding always works; showing only when the rules want the overlay now.
+                        state.visible = state.wanted && !state.user_hidden;
                         let visible = state.visible;
                         drop(state);
                         unsafe { ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE }); }
@@ -1616,6 +1813,9 @@ struct SettingsApp {
     status: String,
     status_error: bool,
     saved_at: Option<Instant>,
+    recent_apps: Vec<String>,
+    recent_checked: Instant,
+    app_edit: String,
 }
 
 impl SettingsApp {
@@ -1664,6 +1864,9 @@ impl SettingsApp {
             status: "Changes apply after you save.".to_string(),
             status_error: false,
             saved_at: None,
+            recent_apps: load_recent_apps(&recent_apps_path()),
+            recent_checked: Instant::now(),
+            app_edit: String::new(),
         }
     }
 
@@ -1871,6 +2074,87 @@ impl SettingsApp {
         toggle_row(ui, "Text shadow", "A soft dark shadow behind the text", &mut self.settings.shadow);
     }
 
+    // 0 = automatic, 1 = always show, 2 = never show.
+    fn rule_of(&self, name: &str) -> u8 {
+        if app_list_contains(&self.settings.always_apps, name) { 1 }
+        else if app_list_contains(&self.settings.never_apps, name) { 2 }
+        else { 0 }
+    }
+
+    fn set_rule(&mut self, name: &str, rule: u8) {
+        self.settings.always_apps.retain(|a| !a.eq_ignore_ascii_case(name));
+        self.settings.never_apps.retain(|a| !a.eq_ignore_ascii_case(name));
+        match rule {
+            1 => self.settings.always_apps.push(name.to_string()),
+            2 => self.settings.never_apps.push(name.to_string()),
+            _ => {}
+        }
+    }
+
+    fn draw_visibility_panel(&mut self, ui: &mut egui::Ui) {
+        card_title(ui, "When to show", "Decide which apps get the overlay.");
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if chip(ui, "Games only", self.settings.visibility == 0, 120.0).clicked() { self.settings.visibility = 0; }
+            if chip(ui, "All apps", self.settings.visibility == 1, 120.0).clicked() { self.settings.visibility = 1; }
+        });
+        let hint = if self.settings.visibility == 0 {
+            "Appears once the focused app has been rendering frames like a game for a moment. Browsers, media players, chat apps, editors and launchers are skipped."
+        } else {
+            "Appears on every app that renders frames."
+        };
+        ui.label(egui::RichText::new(hint).size(11.5).color(C_MUTED));
+
+        // The overlay keeps a list of apps it has seen; refresh it while this window is open.
+        if self.recent_checked.elapsed() >= Duration::from_millis(1500) {
+            self.recent_checked = Instant::now();
+            self.recent_apps = load_recent_apps(&recent_apps_path());
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(1500));
+
+        let mut names: Vec<String> = self.recent_apps.clone();
+        for name in self.settings.always_apps.iter().chain(self.settings.never_apps.iter()) {
+            if !names.contains(name) { names.push(name.clone()); }
+        }
+
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("APPS").size(10.5).strong().color(C_MUTED));
+        if names.is_empty() {
+            ui.label(egui::RichText::new("Apps show up here once the overlay has seen them rendering frames.").size(11.5).color(C_MUTED));
+        }
+        let mut change: Option<(String, u8)> = None;
+        for name in &names {
+            let rule = self.rule_of(name);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(name.as_str()).color(C_TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if chip(ui, "Hide", rule == 2, 0.0).clicked() { change = Some((name.clone(), 2)); }
+                    if chip(ui, "Show", rule == 1, 0.0).clicked() { change = Some((name.clone(), 1)); }
+                    if chip(ui, "Auto", rule == 0, 0.0).clicked() { change = Some((name.clone(), 0)); }
+                });
+            });
+        }
+        if let Some((name, rule)) = change { self.set_rule(&name, rule); }
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.app_edit)
+                    .hint_text("game.exe")
+                    .desired_width(150.0),
+            );
+            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if action_button(ui, "Add & show", BtnKind::Secondary, 110.0).clicked() || enter {
+                if let Some(name) = normalize_app_name(&self.app_edit) {
+                    let total = self.settings.always_apps.len() + self.settings.never_apps.len();
+                    if total < MAX_APP_RULES { self.set_rule(&name, 1); }
+                    self.app_edit.clear();
+                }
+            }
+        });
+        ui.label(egui::RichText::new("Show: always. Hide: never. Auto: let the overlay decide.").size(11.5).color(C_MUTED));
+    }
+
     fn draw_display_panel(&mut self, ui: &mut egui::Ui) {
         card_title(ui, "Overlay items", "Switch each reading on or off.");
         ui.add_space(8.0);
@@ -1915,7 +2199,12 @@ impl SettingsApp {
     }
 
     fn reset_defaults(&mut self) {
+        // Per-app rules are kept: they are choices about games, not about looks.
+        let always_apps = self.settings.always_apps.clone();
+        let never_apps = self.settings.never_apps.clone();
         self.settings = OverlaySettings::default();
+        self.settings.always_apps = always_apps;
+        self.settings.never_apps = never_apps;
         self.color_edit = self.settings.color_hex.clone();
         self.status = "Defaults loaded. Press Save to keep them.".to_string();
         self.status_error = false;
@@ -1931,7 +2220,7 @@ impl eframe::App for SettingsApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Zoro FPS Overlay").size(18.0).strong().color(C_TEXT));
-                    ui.label(egui::RichText::new("v0.5.0").size(11.0).color(C_MUTED));
+                    ui.label(egui::RichText::new("v0.6.0").size(11.0).color(C_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         key_hint(ui, "F10", "Quit");
                         ui.add_space(8.0);
@@ -1978,6 +2267,8 @@ impl eframe::App for SettingsApp {
                     card(&mut columns[1], |ui| self.draw_preview_panel(ui));
                     columns[1].add_space(8.0);
                     egui::ScrollArea::vertical().id_salt("scroll-right").auto_shrink([false, false]).show(&mut columns[1], |ui| {
+                        card(ui, |ui| self.draw_visibility_panel(ui));
+                        ui.add_space(8.0);
                         card(ui, |ui| self.draw_layout_panel(ui));
                         ui.add_space(8.0);
                         card(ui, |ui| self.draw_appearance_panel(ui));
@@ -2048,6 +2339,7 @@ fn run_overlay() {
     let _ = fs::write(&diagnostic_path, "");
     let _ = fs::write(&presentmon_output_path, "");
     let sys_log_path = diagnostic_path.clone();
+    let recent_path = recent_apps_path();
     let _ = APP.set(Mutex::new(AppState {
         own_pid,
         presentmon_path,
@@ -2063,6 +2355,15 @@ fn run_overlay() {
         target_name: None,
         target_pid: None,
         user_hidden: false,
+        wanted: false,
+        foreground_seen: None,
+        capture_last_focus: Instant::now(),
+        rate_since: None,
+        confirmed: false,
+        last_flowing: None,
+        recorded_current: false,
+        recent_apps: load_recent_apps(&recent_path),
+        recent_path,
     }));
 
     let sys_stats = Arc::new(SysStats::new());
@@ -2137,5 +2438,72 @@ fn main() {
         run_overlay();
     } else {
         run_settings_gui();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_names_are_normalized() {
+        assert_eq!(normalize_app_name("C:\\Games\\Foo.EXE"), Some("foo.exe".to_string()));
+        assert_eq!(normalize_app_name("  \"Game\"  "), Some("game.exe".to_string()));
+        assert_eq!(normalize_app_name("a,b.exe"), None);
+        assert_eq!(normalize_app_name("   "), None);
+    }
+
+    #[test]
+    fn app_lists_drop_duplicates_and_junk() {
+        let list = vec!["A.exe".to_string(), "a.exe".to_string(), "b=c".to_string(), "".to_string()];
+        assert_eq!(clean_app_list(&list), vec!["a.exe".to_string()]);
+    }
+
+    #[test]
+    fn classification_follows_rules_then_mode() {
+        let mut s = OverlaySettings::default();
+        assert_eq!(classify_app(&s, "chrome.exe"), AppClass::Never);
+        assert_eq!(classify_app(&s, "somegame.exe"), AppClass::Candidate);
+        s.visibility = 1;
+        assert_eq!(classify_app(&s, "chrome.exe"), AppClass::Candidate);
+        s.visibility = 0;
+        s.always_apps = vec!["chrome.exe".to_string()];
+        assert_eq!(classify_app(&s, "Chrome.exe"), AppClass::Always);
+        s.never_apps = vec!["chrome.exe".to_string()];
+        assert_eq!(classify_app(&s, "chrome.exe"), AppClass::Never);
+    }
+
+    #[test]
+    fn metrics_format_with_and_without_labels() {
+        let values = MetricValues { fps: Some(144), cpu: Some(23), ..Default::default() };
+        assert_eq!(format_metric(Metric::Fps, &values, "", true), "144 FPS");
+        assert_eq!(format_metric(Metric::Fps, &values, "", false), "144");
+        assert_eq!(format_metric(Metric::Cpu, &values, "", true), "CPU 23%");
+        assert_eq!(format_metric(Metric::Ram, &values, "", true), "RAM --");
+        assert_eq!(format_metric(Metric::Fps, &MetricValues::default(), "ERR", true), "FPS ERR");
+    }
+
+    #[test]
+    fn settings_survive_a_save_and_load() {
+        let mut s = OverlaySettings::default();
+        s.layout = 1;
+        s.show_cpu = true;
+        s.visibility = 1;
+        s.always_apps = vec!["game.exe".to_string()];
+        s.never_apps = vec!["tool.exe".to_string()];
+        s.normalize();
+        let path = std::env::temp_dir().join(format!("zoro-settings-test-{}.ini", std::process::id()));
+        save_settings(&path, &s).unwrap();
+        let loaded = load_settings(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(loaded, s);
+    }
+
+    #[test]
+    fn settings_never_end_up_with_nothing_to_show() {
+        let mut s = OverlaySettings::default();
+        s.show_fps = false;
+        s.normalize();
+        assert!(s.show_fps);
     }
 }

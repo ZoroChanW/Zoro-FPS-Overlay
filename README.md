@@ -17,6 +17,7 @@ A lightweight, minimal FPS overlay for Windows. It shows FPS, frametime, 1% lows
 - **Column or row layout:** stack the readings vertically or line them up side by side.
 - **No injection, no hooking:** frame timing comes from [PresentMon](https://github.com/GameTechDev/PresentMon) and the overlay is a separate, click-through window. Nothing is loaded into the game process.
 - **Made to be adjusted:** 9 screen anchors with pixel offsets, 7 fonts, size, color, bold, text shadow, labels and spacing, with a live preview.
+- **Games only, by default:** the overlay shows for games, not for your browser or editor, with no flicker. Per-app Show / Hide rules override the automatic choice, and **All apps** mode is one click away.
 - **Changes apply instantly:** save in the settings window and the running overlay updates within half a second.
 - **Tiny footprint:** the settings window is built with `egui`/`eframe` and is only open when you need it.
 
@@ -61,7 +62,7 @@ The GPU counters are only queried while the GPU item is switched on.
 1. Run `zoro-fps-overlay.exe` without arguments to open the settings window.
 2. Choose which readings to show, where they go and how they look. The preview at the top updates as you change things.
 3. Press **Save & Start**. This saves your settings, starts the overlay and closes the settings window. **Save** only saves, and **Reset** restores the defaults (they are applied when you save).
-4. Start a game. The overlay appears when a game or other application is in the foreground, and hides again on the desktop and in system windows.
+4. Start a game. In the default **Games only** mode the overlay appears once the focused app has been rendering frames for a moment, and hides again on the desktop, in system windows and in everyday apps such as browsers.
 
 You can reopen the settings window at any time. Closing it does not stop the overlay.
 
@@ -83,6 +84,7 @@ You can reopen the settings window at any time. Closing it does not stop the ove
 | **Font** | Segoe UI, Consolas, Arial, Tahoma, Verdana, Bahnschrift or Courier New. The font must be installed. Consolas keeps digits evenly spaced. |
 | **Size and color** | Text size of 18 to 64 px, and any `RRGGBB` color. Pure black (`000000`) is not allowed because it is the overlay's transparent color. |
 | **Style** | Bold text and an optional soft shadow. |
+| **When to show** | **Games only** (default) or **All apps**, plus per-app Auto / Show / Hide rules. See below. |
 
 Settings are stored in `%APPDATA%\ZoroFPSOverlay\settings.ini`. The running overlay checks the file every 500 ms and applies changes by itself.
 
@@ -103,8 +105,19 @@ Settings are stored in `%APPDATA%\ZoroFPSOverlay\settings.ini`. The running over
 | `show_labels` | `1` or `0` | `1` |
 | `bold`, `shadow` | `1` or `0` | bold on, shadow off |
 | `font_family` | one of the fonts listed above | `Segoe UI` |
+| `visibility` | `0` games only, `1` all apps | `0` |
+| `always_apps`, `never_apps` | comma-separated process names, e.g. `game.exe,other.exe` | empty |
 
 </details>
+
+## When the overlay shows
+
+- **Games only** (default): the focused app is measured with PresentMon. The overlay appears after it has produced at least 10 FPS for about 1.2 seconds, and it stays visible until frames have been missing for 5 seconds. A loading screen or a low-FPS scene therefore never hides it, and a short alt-tab does not make it flicker. Browsers, media players, chat apps, editors, terminals, office apps and game launchers are skipped.
+- **All apps:** the overlay shows on any app that is in the foreground and rendering frames.
+- **Per-app rules:** apps the overlay has seen rendering frames are listed in the settings window. Set one to **Show** (always), **Hide** (never) or **Auto**. You can also add a process name by hand. A **Hide** rule wins over a **Show** rule.
+- `F8` hides the overlay manually. Showing it again only works while the rules want it visible.
+
+Detection is a heuristic, not a guarantee. If it ever picks wrong, a Show or Hide rule fixes that app for good.
 
 ## How it works
 
@@ -146,6 +159,12 @@ Ideas, not promises:
 - CPU/GPU temperatures and VRAM usage.
 
 ## Changelog
+
+**v0.6.0**
+- Games-only visibility with a dwell time and hysteresis, so there is no flicker and no false hiding in games.
+- Per-app Auto / Show / Hide rules and an **All apps** mode.
+- A short alt-tab no longer restarts the measurement.
+- `F8` can no longer show the overlay on the desktop.
 
 **v0.5.0**
 - CPU, RAM and GPU usage readings, each one switchable.
