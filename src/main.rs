@@ -580,6 +580,13 @@ fn recent_apps_path() -> PathBuf {
     settings_file_path().with_file_name("recent_apps.txt")
 }
 
+fn save_recent_apps(path: &PathBuf, apps: &[String]) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, apps.join("\n"));
+}
+
 fn load_recent_apps(path: &PathBuf) -> Vec<String> {
     let Ok(contents) = fs::read_to_string(path) else { return Vec::new(); };
     let lines: Vec<String> = contents.lines().map(str::to_string).collect();
@@ -724,13 +731,12 @@ impl AppState {
     // Puts an app at the top of the recently seen list that the settings window shows.
     fn remember_recent_app(&mut self, name: &str) {
         let Some(name) = normalize_app_name(name) else { return; };
+        // Re-read the file first so apps removed from the settings window stay removed.
+        self.recent_apps = load_recent_apps(&self.recent_path);
         self.recent_apps.retain(|a| *a != name);
         self.recent_apps.insert(0, name);
         self.recent_apps.truncate(RECENT_APPS_MAX);
-        if let Some(parent) = self.recent_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(&self.recent_path, self.recent_apps.join("\n"));
+        save_recent_apps(&self.recent_path, &self.recent_apps);
     }
 
     // Forgets the PresentMon readings (system readings are kept).
@@ -2123,11 +2129,13 @@ impl SettingsApp {
             ui.label(egui::RichText::new("Apps show up here once the overlay has seen them rendering frames.").size(11.5).color(C_MUTED));
         }
         let mut change: Option<(String, u8)> = None;
+        let mut remove: Option<String> = None;
         for name in &names {
             let rule = self.rule_of(name);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(name.as_str()).color(C_TEXT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if chip(ui, "\u{d7}", false, 32.0).on_hover_text("Remove from list").clicked() { remove = Some(name.clone()); }
                     if chip(ui, "Hide", rule == 2, 0.0).clicked() { change = Some((name.clone(), 2)); }
                     if chip(ui, "Show", rule == 1, 0.0).clicked() { change = Some((name.clone(), 1)); }
                     if chip(ui, "Auto", rule == 0, 0.0).clicked() { change = Some((name.clone(), 0)); }
@@ -2135,6 +2143,13 @@ impl SettingsApp {
             });
         }
         if let Some((name, rule)) = change { self.set_rule(&name, rule); }
+        if let Some(name) = remove {
+            // Forget the app: drop its rules and take it off the recently seen list.
+            self.set_rule(&name, 0);
+            self.recent_apps.retain(|a| *a != name);
+            save_recent_apps(&recent_apps_path(), &self.recent_apps);
+            self.recent_checked = Instant::now();
+        }
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -2152,7 +2167,7 @@ impl SettingsApp {
                 }
             }
         });
-        ui.label(egui::RichText::new("Show: always. Hide: never. Auto: let the overlay decide.").size(11.5).color(C_MUTED));
+        ui.label(egui::RichText::new("Show: always. Hide: never. Auto: let the overlay decide. \u{d7}: remove from the list (save to apply rule changes).").size(11.5).color(C_MUTED));
     }
 
     fn draw_display_panel(&mut self, ui: &mut egui::Ui) {
@@ -2220,7 +2235,7 @@ impl eframe::App for SettingsApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Zoro FPS Overlay").size(18.0).strong().color(C_TEXT));
-                    ui.label(egui::RichText::new("v0.6.0").size(11.0).color(C_MUTED));
+                    ui.label(egui::RichText::new("v0.6.1").size(11.0).color(C_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         key_hint(ui, "F10", "Quit");
                         ui.add_space(8.0);
@@ -2497,6 +2512,18 @@ mod tests {
         let loaded = load_settings(&path);
         let _ = fs::remove_file(&path);
         assert_eq!(loaded, s);
+    }
+
+    #[test]
+    fn recent_apps_file_round_trips_and_removal_sticks() {
+        let path = std::env::temp_dir().join(format!("zoro-recent-test-{}.txt", std::process::id()));
+        save_recent_apps(&path, &["a.exe".to_string(), "b.exe".to_string()]);
+        let mut apps = load_recent_apps(&path);
+        assert_eq!(apps, vec!["a.exe".to_string(), "b.exe".to_string()]);
+        apps.retain(|a| a != "a.exe");
+        save_recent_apps(&path, &apps);
+        assert_eq!(load_recent_apps(&path), vec!["b.exe".to_string()]);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

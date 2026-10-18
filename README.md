@@ -114,7 +114,7 @@ Settings are stored in `%APPDATA%\ZoroFPSOverlay\settings.ini`. The running over
 
 - **Games only** (default): the focused app is measured with PresentMon. The overlay appears after it has produced at least 10 FPS for about 1.2 seconds, and it stays visible until frames have been missing for 5 seconds. A loading screen or a low-FPS scene therefore never hides it, and a short alt-tab does not make it flicker. Browsers, media players, chat apps, editors, terminals, office apps and game launchers are skipped.
 - **All apps:** the overlay shows on any app that is in the foreground and rendering frames.
-- **Per-app rules:** apps the overlay has seen rendering frames are listed in the settings window. Set one to **Show** (always), **Hide** (never) or **Auto**. You can also add a process name by hand. A **Hide** rule wins over a **Show** rule.
+- **Per-app rules:** apps the overlay has seen rendering frames are listed in the settings window. Set one to **Show** (always), **Hide** (never) or **Auto**. You can also add a process name by hand, and remove an app from the list with the `×` button. A **Hide** rule wins over a **Show** rule.
 - `F8` hides the overlay manually. Showing it again only works while the rules want it visible.
 
 Detection is a heuristic, not a guarantee. If it ever picks wrong, a Show or Hide rule fixes that app for good.
@@ -159,6 +159,9 @@ Ideas, not promises:
 - CPU/GPU temperatures and VRAM usage.
 
 ## Changelog
+
+**v0.6.1**
+- Apps can be removed from the **When to show** list with the `×` button (this also clears their Show / Hide rule once you save).
 
 **v0.6.0**
 - Games-only visibility with a dwell time and hysteresis, so there is no flicker and no false hiding in games.
