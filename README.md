@@ -82,7 +82,7 @@ You can reopen the settings window at any time. Closing it does not stop the ove
 | **Items** | FPS, frametime, 1% low, CPU, RAM, GPU. At least one stays on. |
 | **Labels** | Show `CPU 23%` or just `23%`. |
 | **Font** | Segoe UI, Consolas, Arial, Tahoma, Verdana, Bahnschrift or Courier New. The font must be installed. Consolas keeps digits evenly spaced. |
-| **Size and color** | Text size of 18 to 64 px, and any `RRGGBB` color. Pure black (`000000`) is not allowed because it is the overlay's transparent color. |
+| **Size and color** | Text size of 18 to 64 px, and any `RRGGBB` color. |
 | **Style** | Bold text and an optional soft shadow. |
 | **When to show** | **Games only** (default) or **All apps**, plus per-app Auto / Show / Hide rules. See below. |
 
@@ -97,7 +97,7 @@ Settings are stored in `%APPDATA%\ZoroFPSOverlay\settings.ini`. The running over
 | `vertical_anchor` | `0` top, `1` middle, `2` bottom | `0` |
 | `offset_x`, `offset_y` | pixels, -4000 to 4000 | `0` |
 | `font_size` | 18 to 64 | `34` |
-| `color` | `RRGGBB`, not `000000` | `E8E4D9` |
+| `color` | `RRGGBB` | `E8E4D9` |
 | `show_fps`, `show_frametime`, `show_low1`, `show_cpu`, `show_ram`, `show_gpu` | `1` or `0` | FPS on, the rest off |
 | `layout` | `0` column, `1` row | `0` |
 | `line_gap` | pixels between lines (column), 0 to 40 | `2` |
@@ -122,7 +122,7 @@ Detection is a heuristic, not a guarantee. If it ever picks wrong, a Show or Hid
 ## How it works
 
 - **Frame timing** is read by a hidden [PresentMon](https://github.com/GameTechDev/PresentMon) process that watches the application in the foreground. The overlay parses its CSV output and computes FPS, frametime and 1% low.
-- **The overlay** is a transparent, always-on-top, click-through Win32 window. It is sized to fit its text exactly, so right-anchored text can reach the very edge of the monitor.
+- **The overlay** is an always-on-top, click-through Win32 window drawn with per-pixel alpha (greyscale antialiased text, fully transparent elsewhere), so there is no halo or noise around the text on any background. It is sized to fit its text exactly, so right-anchored text can reach the very edge of the monitor.
 - **CPU and RAM** come from `GetSystemTimes` and `GlobalMemoryStatusEx`. **GPU** comes from the Windows PDH "GPU Engine" counters. They refresh once per second.
 - **The settings window** is the only part that uses `egui`/`eframe` (Glow renderer, so the default `wgpu` stack is not pulled in).
 
@@ -158,7 +158,25 @@ Ideas, not promises:
 - Per-game profiles.
 - CPU/GPU temperatures and VRAM usage.
 
+## Project layout
+
+| File | Purpose |
+| --- | --- |
+| `src/main.rs` | Entry point: settings window or `--overlay` mode. |
+| `src/ffi.rs` | Raw Win32 declarations. |
+| `src/settings.rs` | Metrics, settings file, per-app rules. |
+| `src/overlay.rs` | The overlay window, state and per-tick logic. |
+| `src/render.rs` | Per-pixel-alpha text rendering. |
+| `src/capture.rs` | PresentMon process control and CSV parsing. |
+| `src/sysstats.rs` | CPU / RAM / GPU readings. |
+| `src/gui.rs` | The egui settings window. |
+| `src/util.rs`, `src/config.rs` | Helpers and tunable constants. |
+
 ## Changelog
+
+**v0.6.2**
+- Fixed noise and pixelated edges around the overlay text in some games: the overlay now uses per-pixel alpha instead of a color key, so ClearType fringes are gone. Black is now a valid text color.
+- Source split into modules.
 
 **v0.6.1**
 - Apps can be removed from the **When to show** list with the `×` button (this also clears their Show / Hide rule once you save).
