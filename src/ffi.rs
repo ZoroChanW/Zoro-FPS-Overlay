@@ -66,6 +66,7 @@ pub(crate) type WNDPROC = Option<unsafe extern "system" fn(HWND, UINT, WPARAM, L
 #[repr(C)]
 pub(crate) struct POINT { pub(crate) x: i32, pub(crate) y: i32 }
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RECT { pub(crate) left: i32, pub(crate) top: i32, pub(crate) right: i32, pub(crate) bottom: i32 }
 #[repr(C)]
 pub(crate) struct SIZE { pub(crate) cx: i32, pub(crate) cy: i32 }
@@ -134,6 +135,65 @@ pub(crate) const AC_SRC_ALPHA: u8 = 0x01;
 pub(crate) const DIB_RGB_COLORS: u32 = 0;
 pub(crate) type HBITMAP = HANDLE;
 
+#[repr(C)]
+pub(crate) struct JobBasicLimits {
+    pub(crate) per_process_user_time: i64, pub(crate) per_job_user_time: i64,
+    pub(crate) limit_flags: u32, pub(crate) min_working_set: usize, pub(crate) max_working_set: usize,
+    pub(crate) active_process_limit: u32, pub(crate) affinity: usize,
+    pub(crate) priority_class: u32, pub(crate) scheduling_class: u32,
+}
+#[repr(C)]
+pub(crate) struct JobExtendedLimits {
+    pub(crate) basic: JobBasicLimits,
+    pub(crate) io: [u64; 6],
+    pub(crate) process_memory_limit: usize, pub(crate) job_memory_limit: usize,
+    pub(crate) peak_process_memory: usize, pub(crate) peak_job_memory: usize,
+}
+pub(crate) const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+pub(crate) const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+
+#[repr(C)]
+pub(crate) struct MONITORINFO { pub(crate) size: DWORD, pub(crate) monitor: RECT, pub(crate) work: RECT, pub(crate) flags: DWORD }
+pub(crate) type MonitorEnumProc = unsafe extern "system" fn(HANDLE, HDC, *mut RECT, LPARAM) -> BOOL;
+pub(crate) const MONITOR_DEFAULTTONEAREST: DWORD = 2;
+pub(crate) const MONITORINFOF_PRIMARY: DWORD = 1;
+
+#[repr(C)]
+pub(crate) struct NOTIFYICONDATAW {
+    pub(crate) size: DWORD, pub(crate) hwnd: HWND, pub(crate) id: UINT, pub(crate) flags: UINT,
+    pub(crate) callback_message: UINT, pub(crate) icon: HICON, pub(crate) tip: [u16; 128],
+    pub(crate) state: DWORD, pub(crate) state_mask: DWORD, pub(crate) info: [u16; 256],
+    pub(crate) version: UINT, pub(crate) info_title: [u16; 64], pub(crate) info_flags: DWORD,
+    pub(crate) guid: [u32; 4], pub(crate) balloon_icon: HICON,
+}
+#[repr(C)]
+pub(crate) struct ICONINFO { pub(crate) is_icon: BOOL, pub(crate) hot_x: DWORD, pub(crate) hot_y: DWORD, pub(crate) mask: HBITMAP, pub(crate) color: HBITMAP }
+pub(crate) const NIM_ADD: DWORD = 0;
+pub(crate) const NIM_MODIFY: DWORD = 1;
+pub(crate) const NIM_DELETE: DWORD = 2;
+pub(crate) const NIF_MESSAGE: UINT = 1;
+pub(crate) const NIF_ICON: UINT = 2;
+pub(crate) const NIF_TIP: UINT = 4;
+pub(crate) const WM_APP: u32 = 0x8000;
+pub(crate) const WM_NULL: u32 = 0x0000;
+pub(crate) const WM_LBUTTONDBLCLK: u32 = 0x0203;
+pub(crate) const WM_RBUTTONUP: u32 = 0x0205;
+pub(crate) const MF_STRING: UINT = 0x0000;
+pub(crate) const MF_CHECKED: UINT = 0x0008;
+pub(crate) const MF_SEPARATOR: UINT = 0x0800;
+pub(crate) const TPM_RIGHTBUTTON: UINT = 0x0002;
+pub(crate) const TPM_RETURNCMD: UINT = 0x0100;
+pub(crate) const MOD_ALT: u32 = 0x0001;
+pub(crate) const MOD_CONTROL: u32 = 0x0002;
+pub(crate) const MOD_SHIFT: u32 = 0x0004;
+pub(crate) const HKEY_CURRENT_USER: HANDLE = 0x8000_0001usize as HANDLE;
+pub(crate) const KEY_QUERY_VALUE: DWORD = 0x0001;
+pub(crate) const KEY_SET_VALUE: DWORD = 0x0002;
+pub(crate) const REG_SZ: DWORD = 1;
+pub(crate) const ERROR_ALREADY_EXISTS: DWORD = 183;
+pub(crate) const SW_RESTORE: i32 = 9;
+pub(crate) const SW_SHOWNORMAL: i32 = 1;
+
 #[link(name = "pdh")]
 extern "system" {
     pub(crate) fn PdhOpenQueryW(data_source: LPCWSTR, user_data: usize, query: *mut HANDLE) -> i32;
@@ -169,6 +229,19 @@ extern "system" {
     pub(crate) fn EndPaint(hwnd: HWND, ps: *const PAINTSTRUCT) -> BOOL;
     pub(crate) fn UpdateLayeredWindow(hwnd: HWND, dst_dc: HDC, dst_pos: *const POINT, size: *const SIZE,
         src_dc: HDC, src_pos: *const POINT, color_key: DWORD, blend: *const BLENDFUNCTION, flags: DWORD) -> BOOL;
+    pub(crate) fn EnumDisplayMonitors(hdc: HDC, clip: *const RECT, callback: MonitorEnumProc, data: LPARAM) -> BOOL;
+    pub(crate) fn GetMonitorInfoW(monitor: HANDLE, info: *mut MONITORINFO) -> BOOL;
+    pub(crate) fn MonitorFromWindow(hwnd: HWND, flags: DWORD) -> HANDLE;
+    pub(crate) fn CreatePopupMenu() -> HANDLE;
+    pub(crate) fn AppendMenuW(menu: HANDLE, flags: UINT, id: usize, text: LPCWSTR) -> BOOL;
+    pub(crate) fn TrackPopupMenu(menu: HANDLE, flags: UINT, x: i32, y: i32, reserved: i32, hwnd: HWND, rect: *const RECT) -> i32;
+    pub(crate) fn DestroyMenu(menu: HANDLE) -> BOOL;
+    pub(crate) fn GetCursorPos(point: *mut POINT) -> BOOL;
+    pub(crate) fn SetForegroundWindow(hwnd: HWND) -> BOOL;
+    pub(crate) fn PostMessageW(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> BOOL;
+    pub(crate) fn RegisterWindowMessageW(name: LPCWSTR) -> UINT;
+    pub(crate) fn CreateIconIndirect(info: *const ICONINFO) -> HICON;
+    pub(crate) fn DestroyIcon(icon: HICON) -> BOOL;
     pub(crate) fn GetWindowRect(hwnd: HWND, rect: *mut RECT) -> BOOL;
     pub(crate) fn InvalidateRect(hwnd: HWND, rect: *const RECT, erase: BOOL) -> BOOL;
     pub(crate) fn LoadCursorW(instance: HINSTANCE, cursor_name: LPCWSTR) -> HCURSOR;
@@ -179,8 +252,34 @@ extern "system" {
     pub(crate) fn DrawTextW(hdc: HDC, text: LPCWSTR, count: i32, rect: *mut RECT, format: UINT) -> i32;
 }
 
+#[link(name = "advapi32")]
+extern "system" {
+    pub(crate) fn AllocateAndInitializeSid(authority: *const [u8; 6], sub_count: u8,
+        a0: DWORD, a1: DWORD, a2: DWORD, a3: DWORD, a4: DWORD, a5: DWORD, a6: DWORD, a7: DWORD,
+        sid: *mut *mut c_void) -> BOOL;
+    pub(crate) fn CheckTokenMembership(token: HANDLE, sid: *const c_void, is_member: *mut BOOL) -> BOOL;
+    pub(crate) fn FreeSid(sid: *mut c_void) -> *mut c_void;
+    pub(crate) fn RegCreateKeyExW(key: HANDLE, sub_key: LPCWSTR, reserved: DWORD, class: LPCWSTR, options: DWORD,
+        access: DWORD, security: *const c_void, result: *mut HANDLE, disposition: *mut DWORD) -> i32;
+    pub(crate) fn RegSetValueExW(key: HANDLE, name: LPCWSTR, reserved: DWORD, kind: DWORD, data: *const u8, size: DWORD) -> i32;
+    pub(crate) fn RegQueryValueExW(key: HANDLE, name: LPCWSTR, reserved: *mut DWORD, kind: *mut DWORD, data: *mut u8, size: *mut DWORD) -> i32;
+    pub(crate) fn RegDeleteValueW(key: HANDLE, name: LPCWSTR) -> i32;
+    pub(crate) fn RegCloseKey(key: HANDLE) -> i32;
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    pub(crate) fn Shell_NotifyIconW(message: DWORD, data: *mut NOTIFYICONDATAW) -> BOOL;
+    pub(crate) fn ShellExecuteW(hwnd: HWND, verb: LPCWSTR, file: LPCWSTR, parameters: LPCWSTR, directory: LPCWSTR, show: i32) -> HANDLE;
+}
+
 #[link(name = "kernel32")]
 extern "system" {
+    pub(crate) fn CreateMutexW(attributes: *const c_void, initial_owner: BOOL, name: LPCWSTR) -> HANDLE;
+    pub(crate) fn GetLastError() -> DWORD;
+    pub(crate) fn CreateJobObjectW(attributes: *const c_void, name: LPCWSTR) -> HANDLE;
+    pub(crate) fn SetInformationJobObject(job: HANDLE, class: i32, info: *const c_void, length: DWORD) -> BOOL;
+    pub(crate) fn AssignProcessToJobObject(job: HANDLE, process: HANDLE) -> BOOL;
     pub(crate) fn GetModuleHandleW(module_name: LPCWSTR) -> HINSTANCE;
     pub(crate) fn GetCurrentProcessId() -> DWORD;
     pub(crate) fn OpenProcess(access: DWORD, inherit: BOOL, process_id: DWORD) -> HANDLE;
@@ -201,6 +300,7 @@ extern "system" {
         quality: DWORD, pitch_and_family: DWORD, face_name: LPCWSTR) -> HFONT;
     pub(crate) fn SelectObject(hdc: HDC, object: HGDIOBJ) -> HGDIOBJ;
     pub(crate) fn CreateCompatibleDC(hdc: HDC) -> HDC;
+    pub(crate) fn CreateBitmap(width: i32, height: i32, planes: UINT, bits_per_pixel: UINT, bits: *const c_void) -> HBITMAP;
     pub(crate) fn DeleteDC(hdc: HDC) -> BOOL;
     pub(crate) fn CreateDIBSection(hdc: HDC, info: *const BITMAPINFO, usage: UINT, bits: *mut *mut c_void,
         section: HANDLE, offset: DWORD) -> HBITMAP;

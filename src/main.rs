@@ -5,24 +5,30 @@
 #[cfg(not(windows))]
 compile_error!("Zoro FPS Overlay currently supports Windows only.");
 
+mod autostart;
 mod capture;
 mod config;
 mod ffi;
 mod gui;
+mod monitors;
 mod overlay;
 mod render;
 mod settings;
 mod sysstats;
+mod tray;
 mod util;
 
+pub(crate) use autostart::*;
 pub(crate) use capture::*;
 pub(crate) use config::*;
 pub(crate) use ffi::*;
 pub(crate) use gui::*;
+pub(crate) use monitors::*;
 pub(crate) use overlay::*;
 pub(crate) use render::*;
 pub(crate) use settings::*;
 pub(crate) use sysstats::*;
+pub(crate) use tray::*;
 pub(crate) use util::*;
 
 

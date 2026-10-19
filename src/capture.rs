@@ -1,9 +1,13 @@
 //! PresentMon capture: process control and CSV parsing.
 use std::os::windows::process::CommandExt;
 use std::collections::VecDeque;
+use std::ffi::c_void;
+use std::os::windows::io::AsRawHandle;
+use std::sync::OnceLock;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
+use std::mem::{size_of, zeroed};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -114,6 +118,38 @@ pub(crate) fn stop_capture(state: &mut AppState) {
     state.clear_capture_values("");
 }
 
+// PresentMon children are placed in a job that Windows closes together with this process,
+// so a crash or a kill of the overlay never leaves PresentMon running in the background.
+static JOB: OnceLock<usize> = OnceLock::new();
+
+fn kill_on_close_job() -> HANDLE {
+    *JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() { return 0; }
+        let mut limits: JobExtendedLimits = zeroed();
+        limits.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            &limits as *const JobExtendedLimits as *const c_void,
+            size_of::<JobExtendedLimits>() as DWORD,
+        );
+        if ok == 0 { CloseHandle(job); return 0; }
+        job as usize
+    }) as HANDLE
+}
+
+fn attach_to_job(child: &Child, log_path: &PathBuf) {
+    let job = kill_on_close_job();
+    if job.is_null() {
+        log_event(log_path, "WARNING: could not create the PresentMon job object");
+        return;
+    }
+    let assigned = unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) };
+    if assigned == 0 {
+        log_event(log_path, "WARNING: could not add PresentMon to the job object");
+    }
+}
+
 pub(crate) fn start_capture(state: &mut AppState, process_name: &str, process_id: u32) {
     stop_capture(state);
     state.target_name = Some(process_name.to_string());
@@ -175,6 +211,7 @@ pub(crate) fn start_capture(state: &mut AppState, process_name: &str, process_id
 
     match command.spawn() {
         Ok(mut child) => {
+            attach_to_job(&child, &state.diagnostic_path);
             let stats = Arc::new(SharedStats::default());
             if let Some(stdout) = child.stdout.take() {
                 spawn_csv_reader(

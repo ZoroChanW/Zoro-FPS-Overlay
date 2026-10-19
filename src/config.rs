@@ -20,5 +20,7 @@ pub(crate) const AUTO_MIN_FPS: u32 = 10;
 pub(crate) const AUTO_SHOW_AFTER: Duration = Duration::from_millis(1200);
 // ...and once it is showing, it stays until frames have been missing this long.
 pub(crate) const AUTO_HIDE_AFTER: Duration = Duration::from_secs(5);
+pub(crate) const OVERLAY_CLASS: &str = "ZoroFpsOverlayWindowV020";
+pub(crate) const SETTINGS_TITLE: &str = "Zoro FPS Overlay — Settings";
 pub(crate) const MAX_APP_RULES: usize = 64;
 pub(crate) const RECENT_APPS_MAX: usize = 12;

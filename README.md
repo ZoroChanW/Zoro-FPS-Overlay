@@ -73,6 +73,12 @@ You can reopen the settings window at any time. Closing it does not stop the ove
 | `F8` | Show or hide the overlay |
 | `F10` | Quit the overlay completely |
 
+Both keys can be changed in the settings window (**Hotkeys & startup**): click the button, then press the new keys, for example `Ctrl+Shift+F`. Letters and digits need Ctrl, Alt or Shift.
+
+### Tray icon and startup
+
+While it runs, the overlay has an icon in the notification area. Right-click it for **Settings**, **Show / hide overlay**, **Start with Windows**, **Restart as administrator** and **Quit**. Double-click opens the settings window. **Start with Windows** adds the overlay to your account's startup list (no administrator rights needed).
+
 ## Customization
 
 | Option | Details |
@@ -84,6 +90,8 @@ You can reopen the settings window at any time. Closing it does not stop the ove
 | **Font** | Segoe UI, Consolas, Arial, Tahoma, Verdana, Bahnschrift or Courier New. The font must be installed. Consolas keeps digits evenly spaced. |
 | **Size and color** | Text size of 18 to 64 px, and any `RRGGBB` color. |
 | **Style** | Bold text and an optional soft shadow. |
+| **Monitor** | **Follow game** (the overlay moves to the monitor of the app in front) or a fixed monitor, numbered left to right. |
+| **Hotkeys** | Show / hide and quit keys, with any of Ctrl, Alt, Shift. |
 | **When to show** | **Games only** (default) or **All apps**, plus per-app Auto / Show / Hide rules. See below. |
 
 Settings are stored in `%APPDATA%\ZoroFPSOverlay\settings.ini`. The running overlay checks the file every 500 ms and applies changes by itself.
@@ -105,6 +113,8 @@ Settings are stored in `%APPDATA%\ZoroFPSOverlay\settings.ini`. The running over
 | `show_labels` | `1` or `0` | `1` |
 | `bold`, `shadow` | `1` or `0` | bold on, shadow off |
 | `font_family` | one of the fonts listed above | `Segoe UI` |
+| `monitor` | `0` follow the app in front, `1` and up a fixed monitor (left to right) | `0` |
+| `hotkey_toggle`, `hotkey_quit` | for example `F8`, `Ctrl+Shift+F` | `F8`, `F10` |
 | `visibility` | `0` games only, `1` all apps | `0` |
 | `always_apps`, `never_apps` | comma-separated process names, e.g. `game.exe,other.exe` | empty |
 
@@ -145,6 +155,7 @@ The overlay writes two log files to your temp folder (`%TEMP%`):
 | Problem | What to try |
 | --- | --- |
 | Overlay never appears | Make sure `PresentMon.exe` is next to the executable, and that the game is the foreground window. Press `F8` in case it was hidden. |
+| `FPS ADMIN` | PresentMon needs permission to read frame timing. Use the tray menu's **Restart as administrator**, or add your account to the **Performance Log Users** group. |
 | `FPS ERR` | PresentMon could not start or exited. Check the PresentMon log. |
 | `FPS ...` | Waiting for the first frames from the game. |
 | `GPU --` | The GPU counters are unavailable or still warming up. Wait a few seconds, then check the diagnostic log. |
@@ -154,9 +165,10 @@ The overlay writes two log files to your temp folder (`%TEMP%`):
 
 Ideas, not promises:
 
+- Per-game profiles and a frametime graph.
+- Benchmark mode (session summary and CSV).
+- VRAM usage and CPU/GPU temperatures.
 - Detect exclusive fullscreen and offer a fallback.
-- Per-game profiles.
-- CPU/GPU temperatures and VRAM usage.
 
 ## Project layout
 
@@ -166,6 +178,8 @@ Ideas, not promises:
 | `src/ffi.rs` | Raw Win32 declarations. |
 | `src/settings.rs` | Metrics, settings file, per-app rules. |
 | `src/overlay.rs` | The overlay window, state and per-tick logic. |
+| `src/monitors.rs` | Monitor list and placement. |
+| `src/tray.rs`, `src/autostart.rs` | Tray icon and menu, Start with Windows. |
 | `src/render.rs` | Per-pixel-alpha text rendering. |
 | `src/capture.rs` | PresentMon process control and CSV parsing. |
 | `src/sysstats.rs` | CPU / RAM / GPU readings. |
@@ -173,6 +187,13 @@ Ideas, not promises:
 | `src/util.rs`, `src/config.rs` | Helpers and tunable constants. |
 
 ## Changelog
+
+**v0.7.0**
+- Multi-monitor: the overlay follows the monitor of the app in front, or stays on a monitor you choose.
+- Tray icon with a menu, a single settings window, and **Start with Windows**.
+- Configurable hotkeys.
+- PresentMon now runs inside a job object, so it is always closed with the overlay, even after a crash.
+- `FPS ADMIN` plus a **Restart as administrator** button when PresentMon lacks permission.
 
 **v0.6.2**
 - Fixed noise and pixelated edges around the overlay text in some games: the overlay now uses per-pixel alpha instead of a color key, so ClearType fringes are gone. Black is now a valid text color.

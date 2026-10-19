@@ -103,6 +103,11 @@ pub(crate) struct OverlaySettings {
     pub(crate) font_family: String,
     // 0 = only apps that render frames like a game, 1 = every app in front.
     pub(crate) visibility: u8,
+    // 0 = follow the monitor of the app in front, 1.. = a fixed monitor (left to right).
+    pub(crate) monitor: u8,
+    // Global hotkeys, e.g. "F8" or "Ctrl+Shift+F".
+    pub(crate) hotkey_toggle: String,
+    pub(crate) hotkey_quit: String,
     // Process names (lowercase, e.g. "game.exe") that always / never get the overlay.
     pub(crate) always_apps: Vec<String>,
     pub(crate) never_apps: Vec<String>,
@@ -131,6 +136,9 @@ impl Default for OverlaySettings {
             shadow: false,
             font_family: "Segoe UI".to_string(),
             visibility: 0,
+            monitor: 0,
+            hotkey_toggle: DEFAULT_HOTKEY_TOGGLE.to_string(),
+            hotkey_quit: DEFAULT_HOTKEY_QUIT.to_string(),
             always_apps: Vec::new(),
             never_apps: Vec::new(),
         }
@@ -176,6 +184,14 @@ impl OverlaySettings {
             .unwrap_or(&FONT_FAMILIES[0])
             .to_string();
         self.visibility = self.visibility.min(1);
+        self.monitor = self.monitor.min(16);
+        self.hotkey_toggle = normalize_hotkey(&self.hotkey_toggle).unwrap_or_else(|| DEFAULT_HOTKEY_TOGGLE.to_string());
+        self.hotkey_quit = normalize_hotkey(&self.hotkey_quit).unwrap_or_else(|| DEFAULT_HOTKEY_QUIT.to_string());
+        if self.hotkey_toggle == self.hotkey_quit {
+            // Two actions cannot share one key; fall back to the defaults.
+            self.hotkey_toggle = DEFAULT_HOTKEY_TOGGLE.to_string();
+            self.hotkey_quit = DEFAULT_HOTKEY_QUIT.to_string();
+        }
         self.always_apps = clean_app_list(&self.always_apps);
         self.never_apps = clean_app_list(&self.never_apps);
         // A Hide rule wins if a name ended up in both lists.
@@ -301,6 +317,75 @@ pub(crate) fn load_recent_apps(path: &PathBuf) -> Vec<String> {
     apps
 }
 
+pub(crate) const DEFAULT_HOTKEY_TOGGLE: &str = "F8";
+pub(crate) const DEFAULT_HOTKEY_QUIT: &str = "F10";
+
+// Keys that can be used for a hotkey, with their Windows virtual-key codes.
+pub(crate) fn hotkey_key_code(name: &str) -> Option<u32> {
+    let upper = name.to_ascii_uppercase();
+    if let Some(number) = upper.strip_prefix('F').and_then(|n| n.parse::<u32>().ok()) {
+        if (1..=12).contains(&number) { return Some(0x6F + number); }
+    }
+    let mut chars = upper.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        if c.is_ascii_uppercase() || c.is_ascii_digit() { return Some(c as u32); }
+    }
+    match upper.as_str() {
+        "INSERT" => Some(0x2D),
+        "DELETE" => Some(0x2E),
+        "HOME" => Some(0x24),
+        "END" => Some(0x23),
+        "PAGEUP" => Some(0x21),
+        "PAGEDOWN" => Some(0x22),
+        "PAUSE" => Some(0x13),
+        _ => None,
+    }
+}
+
+// "Ctrl+Shift+F8" -> (modifier flags, virtual-key code). Letters and digits need a modifier,
+// otherwise the hotkey would swallow normal typing in every program.
+pub(crate) fn parse_hotkey(text: &str) -> Option<(u32, u32)> {
+    let mut mods = 0u32;
+    let mut key: Option<&str> = None;
+    for part in text.split('+').map(str::trim) {
+        match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => mods |= MOD_CONTROL,
+            "alt" => mods |= MOD_ALT,
+            "shift" => mods |= MOD_SHIFT,
+            "" => return None,
+            _ => { if key.is_some() { return None; } key = Some(part); }
+        }
+    }
+    let code = hotkey_key_code(key?)?;
+    let is_plain_character = (0x30..=0x5A).contains(&code);
+    if is_plain_character && mods == 0 { return None; }
+    Some((mods, code))
+}
+
+// The canonical spelling ("ctrl + f8" -> "Ctrl+F8"), or None when the text is not a usable hotkey.
+pub(crate) fn normalize_hotkey(text: &str) -> Option<String> {
+    let (mods, code) = parse_hotkey(text)?;
+    let key_part = text.split('+').map(str::trim).last()?;
+    let key_name = match code {
+        0x70..=0x7B => format!("F{}", code - 0x6F),
+        0x30..=0x5A => (code as u8 as char).to_string(),
+        _ => match key_part.to_ascii_uppercase().as_str() {
+            "INSERT" => "Insert", "DELETE" => "Delete", "HOME" => "Home", "END" => "End",
+            "PAGEUP" => "PageUp", "PAGEDOWN" => "PageDown", _ => "Pause",
+        }.to_string(),
+    };
+    Some(format_hotkey(mods, &key_name))
+}
+
+pub(crate) fn format_hotkey(mods: u32, key_name: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if mods & MOD_CONTROL != 0 { parts.push("Ctrl"); }
+    if mods & MOD_ALT != 0 { parts.push("Alt"); }
+    if mods & MOD_SHIFT != 0 { parts.push("Shift"); }
+    parts.push(key_name);
+    parts.join("+")
+}
+
 pub(crate) fn normalize_color(value: &str) -> Option<String> {
     let clean = value.trim().trim_start_matches('#');
     if clean.len() != 6 || !clean.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -344,6 +429,9 @@ pub(crate) fn load_settings(path: &PathBuf) -> OverlaySettings {
             "bold" => result.bold = value == "1",
             "shadow" => result.shadow = value == "1",
             "font_family" => result.font_family = value.to_string(),
+            "hotkey_toggle" => result.hotkey_toggle = value.to_string(),
+            "hotkey_quit" => result.hotkey_quit = value.to_string(),
+            "monitor" => if let Ok(v) = value.parse::<u8>() { result.monitor = v; },
             "visibility" => if let Ok(v) = value.parse::<u8>() { result.visibility = v; },
             "always_apps" => result.always_apps = value.split(',').map(str::to_string).collect(),
             "never_apps" => result.never_apps = value.split(',').map(str::to_string).collect(),
@@ -362,14 +450,14 @@ pub(crate) fn save_settings(path: &PathBuf, settings: &OverlaySettings) -> Resul
         "horizontal_anchor={}\nvertical_anchor={}\noffset_x={}\noffset_y={}\nfont_size={}\ncolor={}\n\
          show_fps={}\nshow_frametime={}\nshow_low1={}\nshow_cpu={}\nshow_ram={}\nshow_gpu={}\n\
          layout={}\nline_gap={}\nitem_gap={}\nshow_labels={}\nbold={}\nshadow={}\nfont_family={}\n\
-         visibility={}\nalways_apps={}\nnever_apps={}\n",
+         hotkey_toggle={}\nhotkey_quit={}\nmonitor={}\nvisibility={}\nalways_apps={}\nnever_apps={}\n",
         settings.horizontal_anchor, settings.vertical_anchor, settings.offset_x,
         settings.offset_y, settings.font_size, settings.color_hex,
         settings.show_fps as u8, settings.show_frametime as u8, settings.show_low1 as u8,
         settings.show_cpu as u8, settings.show_ram as u8, settings.show_gpu as u8,
         settings.layout, settings.line_gap, settings.item_gap,
         settings.show_labels as u8, settings.bold as u8, settings.shadow as u8,
-        settings.font_family, settings.visibility,
+        settings.font_family, settings.hotkey_toggle, settings.hotkey_quit, settings.monitor, settings.visibility,
         settings.always_apps.join(","), settings.never_apps.join(",")
     );
     fs::write(path, content).map_err(|e| format!("Couldn't save settings: {}", e))
@@ -444,6 +532,57 @@ mod tests {
         save_recent_apps(&path, &apps);
         assert_eq!(load_recent_apps(&path), vec!["b.exe".to_string()]);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hotkeys_parse_and_normalize() {
+        assert_eq!(parse_hotkey("F8"), Some((0, 0x77)));
+        assert_eq!(parse_hotkey("ctrl + shift + f12"), Some((MOD_CONTROL | MOD_SHIFT, 0x7B)));
+        assert_eq!(normalize_hotkey("alt+o"), Some("Alt+O".to_string()));
+        assert_eq!(normalize_hotkey("shift+ctrl+pagedown"), Some("Ctrl+Shift+PageDown".to_string()));
+        // A bare letter or digit would hijack normal typing everywhere.
+        assert_eq!(parse_hotkey("O"), None);
+        assert_eq!(parse_hotkey("5"), None);
+        assert_eq!(parse_hotkey("Ctrl+"), None);
+        assert_eq!(parse_hotkey("F13"), None);
+        assert_eq!(parse_hotkey("Ctrl+A+B"), None);
+    }
+
+    #[test]
+    fn clashing_or_broken_hotkeys_fall_back_to_defaults() {
+        let mut s = OverlaySettings::default();
+        s.hotkey_toggle = "F9".to_string();
+        s.hotkey_quit = "F9".to_string();
+        s.normalize();
+        assert_eq!((s.hotkey_toggle.as_str(), s.hotkey_quit.as_str()), ("F8", "F10"));
+        s.hotkey_toggle = "nonsense".to_string();
+        s.normalize();
+        assert_eq!(s.hotkey_toggle, "F8");
+    }
+
+    #[test]
+    fn monitors_are_numbered_left_to_right() {
+        let make = |left: i32, primary: bool| MonitorInfo {
+            rect: RECT { left, top: 0, right: left + 1920, bottom: 1080 },
+            primary,
+        };
+        let mut list = vec![make(1920, false), make(0, true), make(-1920, false)];
+        sort_monitors(&mut list);
+        let lefts: Vec<i32> = list.iter().map(|m| m.rect.left).collect();
+        assert_eq!(lefts, vec![-1920, 0, 1920]);
+    }
+
+    #[test]
+    fn overlay_geometry_stays_on_its_monitor() {
+        let mut s = OverlaySettings::default();
+        s.horizontal_anchor = 2;
+        s.vertical_anchor = 2;
+        s.offset_x = 4000;
+        s.offset_y = 4000;
+        let screen = RECT { left: 1920, top: 100, right: 3840, bottom: 1180 };
+        let (x, y, w, h) = place_overlay(&s, &screen, 300, 80);
+        assert!(x >= screen.left && x + w <= screen.right);
+        assert!(y >= screen.top && y + h <= screen.bottom);
     }
 
     #[test]

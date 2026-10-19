@@ -7,10 +7,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use crate::*;
 
-pub(crate) fn overlay_geometry(settings: &OverlaySettings) -> (i32, i32, i32, i32) {
-    let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(640);
-    let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(480);
+// Window position and size for the given monitor (virtual-desktop pixels).
+pub(crate) fn overlay_geometry(settings: &OverlaySettings, screen: &RECT) -> (i32, i32, i32, i32) {
     let (width, height) = settings.window_size();
+    place_overlay(settings, screen, width, height)
+}
+
+// The position part of the geometry, kept separate so it can be tested without any drawing.
+pub(crate) fn place_overlay(settings: &OverlaySettings, screen: &RECT, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    let screen_w = (screen.right - screen.left).max(640);
+    let screen_h = (screen.bottom - screen.top).max(480);
     // Process DPI awareness is enabled before creating any windows, so these
     // metrics and SetWindowPos coordinates use the same physical-pixel space.
     // Anchor selects the starting point; offsets always follow the intuitive
@@ -25,8 +31,8 @@ pub(crate) fn overlay_geometry(settings: &OverlaySettings) -> (i32, i32, i32, i3
         2 => screen_h - height - OVERLAY_EDGE_MARGIN,
         _ => OVERLAY_EDGE_MARGIN,
     };
-    let x = (base_x + settings.offset_x).clamp(0, (screen_w - width).max(0));
-    let y = (base_y + settings.offset_y).clamp(0, (screen_h - height).max(0));
+    let x = screen.left + (base_x + settings.offset_x).clamp(0, (screen_w - width).max(0));
+    let y = screen.top + (base_y + settings.offset_y).clamp(0, (screen_h - height).max(0));
     (x, y, width, height)
 }
 
@@ -58,6 +64,10 @@ pub(crate) struct AppState {
     pub(crate) recorded_current: bool,
     pub(crate) recent_apps: Vec<String>,
     pub(crate) recent_path: PathBuf,
+    // Whether PresentMon is allowed to start its trace (administrator / Performance Log Users).
+    pub(crate) trace_access: bool,
+    // The monitor the overlay window currently sits on.
+    pub(crate) screen: RECT,
 }
 
 pub(crate) static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -98,11 +108,13 @@ pub(crate) fn update_overlay(hwnd: HWND) {
         state.last_settings_check = Instant::now();
         let new_settings = load_settings(&state.settings_path);
         if new_settings != state.settings {
+            let hotkeys_changed = new_settings.hotkey_toggle != state.settings.hotkey_toggle
+                || new_settings.hotkey_quit != state.settings.hotkey_quit;
             state.settings = new_settings;
             settings_changed = true;
-            let (x, y, width, height) = overlay_geometry(&state.settings);
-            unsafe {
-                SetWindowPos(hwnd, (-1isize) as HWND, x, y, width, height, SWP_NOACTIVATE);
+            if hotkeys_changed {
+                let (settings, log_path) = (state.settings.clone(), state.diagnostic_path.clone());
+                register_hotkeys(hwnd, &settings, &log_path);
             }
             log_event(&state.diagnostic_path, "Settings reloaded from settings.ini; overlay geometry/style updated");
         }
@@ -116,6 +128,16 @@ pub(crate) fn update_overlay(hwnd: HWND) {
     let now = Instant::now();
     // The app in front, unless it is the desktop, a system window or this program.
     let foreground = foreground_name.as_deref().filter(|n| !is_system_or_shell_process(n));
+
+    // Put the overlay on the right monitor, and resize it after a settings change.
+    let front = if foreground.is_some() { Some(fg) } else { None };
+    let wanted_screen = pick_screen(state.settings.monitor, front, state.screen);
+    if settings_changed || wanted_screen != state.screen {
+        state.screen = wanted_screen;
+        let (x, y, width, height) = overlay_geometry(&state.settings, &state.screen);
+        unsafe { SetWindowPos(hwnd, (-1isize) as HWND, x, y, width, height, SWP_NOACTIVATE); }
+        settings_changed = true;
+    }
     let class = foreground.map(|n| classify_app(&state.settings, n));
     let measurable = matches!(class, Some(AppClass::Always) | Some(AppClass::Candidate));
 
@@ -160,7 +182,8 @@ pub(crate) fn update_overlay(hwnd: HWND) {
         // Clear the exited child handle but keep the target identity, so we do not
         // repeatedly respawn or flood the diagnostic log every 250 ms.
         state.capture = None;
-        state.clear_capture_values("ERR");
+        let note = if state.trace_access { "ERR" } else { "ADMIN" };
+        state.clear_capture_values(note);
     } else {
         // Only show a reading while frame samples are recent, so a stopped
         // game or a hung PresentMon process does not leave a stale FPS forever.
@@ -246,25 +269,25 @@ pub(crate) unsafe extern "system" fn window_proc(hwnd: HWND, msg: UINT, wparam: 
         }
         WM_TIMER => { update_overlay(hwnd); 0 }
         WM_HOTKEY => {
-            let id = wparam as i32;
-            if id == 1 {
-                if let Some(m) = APP.get() {
-                    if let Ok(mut state) = m.lock() {
-                        state.user_hidden = !state.user_hidden;
-                        // Hiding always works; showing only when the rules want the overlay now.
-                        state.visible = state.wanted && !state.user_hidden;
-                        let visible = state.visible;
-                        drop(state);
-                        unsafe { ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE }); }
-                    }
-                }
-            } else if id == 2 {
-                PostQuitMessage(0);
+            match wparam as i32 {
+                1 => toggle_overlay_visibility(hwnd),
+                2 => { PostQuitMessage(0); }
+                _ => {}
             }
             0
         }
+        WM_TRAY => {
+            match (lparam as u32) & 0xFFFF {
+                WM_RBUTTONUP => show_tray_menu(hwnd),
+                WM_LBUTTONDBLCLK => { let _ = open_settings_window(); }
+                _ => {}
+            }
+            0
+        }
+        WM_QUIT_OVERLAY => { PostQuitMessage(0); 0 }
         WM_NCHITTEST => HTTRANSPARENT,
         WM_DESTROY => {
+            remove_tray_icon(hwnd);
             UnregisterHotKey(hwnd, 1);
             UnregisterHotKey(hwnd, 2);
             if let Some(m) = APP.get() {
@@ -273,7 +296,39 @@ pub(crate) unsafe extern "system" fn window_proc(hwnd: HWND, msg: UINT, wparam: 
             PostQuitMessage(0);
             0
         }
+        _ if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::Relaxed) => {
+            // Explorer restarted; the tray icon has to be added again.
+            add_tray_icon(hwnd);
+            0
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// Hides or shows the overlay by hand (the toggle hotkey and the tray menu).
+pub(crate) fn toggle_overlay_visibility(hwnd: HWND) {
+    let Some(mut state) = APP.get().and_then(|m| m.lock().ok()) else { return; };
+    state.user_hidden = !state.user_hidden;
+    // Hiding always works; showing only when the rules want the overlay now.
+    state.visible = state.wanted && !state.user_hidden;
+    let visible = state.visible;
+    drop(state);
+    unsafe { ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE }); }
+    if visible { paint_overlay(hwnd); }
+}
+
+// (Re)registers the global hotkeys from the settings. A key another program already owns
+// cannot be registered; that is written to the diagnostic log.
+pub(crate) fn register_hotkeys(hwnd: HWND, settings: &OverlaySettings, log_path: &PathBuf) {
+    unsafe {
+        UnregisterHotKey(hwnd, 1);
+        UnregisterHotKey(hwnd, 2);
+        for (id, text) in [(1, &settings.hotkey_toggle), (2, &settings.hotkey_quit)] {
+            let Some((mods, key)) = parse_hotkey(text) else { continue; };
+            if RegisterHotKey(hwnd, id, mods | MOD_NOREPEAT, key) == 0 {
+                log_event(log_path, &format!("WARNING: could not register hotkey {} (another program may use it)", text));
+            }
+        }
     }
 }
 
@@ -296,7 +351,14 @@ pub(crate) fn run_overlay() {
         message_box("An older Zoro FPS Overlay is still running. Press F10 to close it, then start this version again.", "Zoro FPS Overlay");
         return;
     }
-    let class_name = wide("ZoroFpsOverlayWindowV020");
+    let class_name = wide(OVERLAY_CLASS);
+    // A relaunch (for example as administrator) waits for the old overlay to close.
+    if std::env::args().skip(1).any(|arg| arg == "--replace") {
+        for _ in 0..40 {
+            if unsafe { FindWindowW(class_name.as_ptr(), std::ptr::null()) }.is_null() { break; }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
     if !unsafe { FindWindowW(class_name.as_ptr(), std::ptr::null()) }.is_null() {
         return;
     }
@@ -310,6 +372,8 @@ pub(crate) fn run_overlay() {
     let _ = fs::write(&diagnostic_path, "");
     let _ = fs::write(&presentmon_output_path, "");
     let sys_log_path = diagnostic_path.clone();
+    let diagnostic_for_hotkeys = diagnostic_path.clone();
+    let start_screen = pick_screen(settings.monitor, None, primary_monitor_rect());
     let recent_path = recent_apps_path();
     let _ = APP.set(Mutex::new(AppState {
         own_pid,
@@ -335,6 +399,8 @@ pub(crate) fn run_overlay() {
         recorded_current: false,
         recent_apps: load_recent_apps(&recent_path),
         recent_path,
+        trace_access: has_trace_access(),
+        screen: start_screen,
     }));
 
     let sys_stats = Arc::new(SysStats::new());
@@ -342,6 +408,7 @@ pub(crate) fn run_overlay() {
     let _ = SYS.set(Arc::clone(&sys_stats));
     spawn_system_stats_thread(sys_stats, sys_log_path);
 
+    let mut tray_window: HWND = std::ptr::null_mut();
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
         let cursor_id = 32512usize as LPCWSTR; // IDC_ARROW
@@ -364,7 +431,7 @@ pub(crate) fn run_overlay() {
             return;
         }
 
-        let (overlay_x, overlay_y, overlay_width, overlay_height) = overlay_geometry(&settings);
+        let (overlay_x, overlay_y, overlay_width, overlay_height) = overlay_geometry(&settings, &start_screen);
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             class_name.as_ptr(), wide("Zoro FPS Overlay").as_ptr(), WS_POPUP,
@@ -376,12 +443,14 @@ pub(crate) fn run_overlay() {
             return;
         }
         SetWindowPos(hwnd, (-1isize) as HWND, overlay_x, overlay_y, overlay_width, overlay_height, SWP_NOACTIVATE);
+        tray_window = hwnd;
         paint_overlay(hwnd);
         // Start hidden. The first supported foreground application makes it visible.
         ShowWindow(hwnd, SW_HIDE);
+        register_taskbar_message();
         let _ = SetTimer(hwnd, TIMER_ID, Duration::from_millis(250).as_millis() as UINT, None);
-        let _ = RegisterHotKey(hwnd, 1, MOD_NOREPEAT, VK_F8);  // toggle
-        let _ = RegisterHotKey(hwnd, 2, MOD_NOREPEAT, VK_F10); // quit
+        register_hotkeys(hwnd, &settings, &diagnostic_for_hotkeys);
+        add_tray_icon(hwnd);
 
         let mut msg: MSG = zeroed();
         loop {
@@ -391,7 +460,8 @@ pub(crate) fn run_overlay() {
             DispatchMessageW(&msg);
         }
     }
-    // F10 posts WM_QUIT directly, so explicitly stop the helper process on exit too.
+    // Quitting posts WM_QUIT directly, so remove the tray icon and stop PresentMon here too.
+    remove_tray_icon(tray_window);
     if let Some(m) = APP.get() {
         if let Ok(mut state) = m.lock() { stop_capture(&mut state); }
     }

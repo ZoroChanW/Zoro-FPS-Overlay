@@ -1,9 +1,10 @@
 //! Small shared helpers.
 use std::os::windows::ffi::OsStrExt;
-use std::ffi::OsStr;
+use std::ffi::{c_void, OsStr};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::*;
 
@@ -80,3 +81,78 @@ pub(crate) fn epoch_millis() -> u64 {
         .as_millis() as u64
 }
 
+
+// True when the calling process's token belongs to the given built-in group
+// (the Administrators group only counts while the process is elevated).
+fn token_in_builtin_group(rid: DWORD) -> bool {
+    unsafe {
+        let nt_authority: [u8; 6] = [0, 0, 0, 0, 0, 5];
+        let mut sid: *mut c_void = std::ptr::null_mut();
+        // S-1-5-32-<rid>: BUILTIN\\<group>
+        if AllocateAndInitializeSid(&nt_authority, 2, 32, rid, 0, 0, 0, 0, 0, 0, &mut sid) == 0 {
+            return false;
+        }
+        let mut member: BOOL = 0;
+        let ok = CheckTokenMembership(std::ptr::null_mut(), sid, &mut member);
+        FreeSid(sid);
+        ok != 0 && member != 0
+    }
+}
+
+// Running as administrator (elevated).
+pub(crate) fn is_elevated() -> bool {
+    token_in_builtin_group(544)
+}
+
+// PresentMon can only start its ETW trace as an administrator or as a member of the
+// "Performance Log Users" group.
+pub(crate) fn has_trace_access() -> bool {
+    is_elevated() || token_in_builtin_group(559)
+}
+
+pub(crate) fn find_overlay_window() -> HWND {
+    unsafe { FindWindowW(wide(OVERLAY_CLASS).as_ptr(), std::ptr::null()) }
+}
+
+// Opens the settings window, or brings the one that is already open to the front.
+pub(crate) fn open_settings_window() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("Couldn't locate this application: {}", e))?;
+    Command::new(exe)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+        .spawn().map(|_| ()).map_err(|e| format!("Couldn't open the settings window: {}", e))
+}
+
+// Only one settings window at a time. Returns false (after focusing the open one) if another exists.
+pub(crate) fn claim_settings_instance() -> bool {
+    unsafe {
+        let _ = CreateMutexW(std::ptr::null(), 0, wide("Local\\ZoroFPSOverlaySettings").as_ptr());
+        if GetLastError() != ERROR_ALREADY_EXISTS { return true; }
+        let window = FindWindowW(std::ptr::null(), wide(SETTINGS_TITLE).as_ptr());
+        if !window.is_null() {
+            ShowWindow(window, SW_RESTORE);
+            SetForegroundWindow(window);
+        }
+        false
+    }
+}
+
+// Starts the overlay again with administrator rights (Windows asks the user to confirm) and
+// then closes the old, non-elevated one.
+pub(crate) fn relaunch_overlay_as_admin() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("Couldn't locate this application: {}", e))?;
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(), wide("runas").as_ptr(), wide(&exe.to_string_lossy()).as_ptr(),
+            wide("--overlay --replace").as_ptr(), std::ptr::null(), SW_SHOWNORMAL,
+        )
+    };
+    if (result as usize) <= 32 {
+        return Err("The administrator prompt was cancelled or could not be shown.".to_string());
+    }
+    // The new overlay waits until the old one is gone.
+    let old = find_overlay_window();
+    if !old.is_null() {
+        unsafe { PostMessageW(old, WM_QUIT_OVERLAY, 0, 0); }
+    }
+    Ok(())
+}

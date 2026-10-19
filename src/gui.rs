@@ -248,6 +248,9 @@ pub(crate) struct SettingsApp {
     pub(crate) recent_apps: Vec<String>,
     pub(crate) recent_checked: Instant,
     pub(crate) app_edit: String,
+    // Which hotkey is waiting for a key press: 0 = show/hide, 1 = quit.
+    pub(crate) capturing: Option<u8>,
+    pub(crate) autostart: bool,
 }
 
 impl SettingsApp {
@@ -299,6 +302,8 @@ impl SettingsApp {
             recent_apps: load_recent_apps(&recent_apps_path()),
             recent_checked: Instant::now(),
             app_edit: String::new(),
+            capturing: None,
+            autostart: autostart_enabled(),
         }
     }
 
@@ -344,6 +349,107 @@ impl SettingsApp {
             ui.add(egui::DragValue::new(&mut self.settings.offset_y).range(-4000..=4000).speed(1).suffix(" px"));
         });
         ui.label(egui::RichText::new("+X moves right, +Y moves down.").size(11.5).color(C_MUTED));
+
+        ui.add_space(14.0);
+        ui.label(egui::RichText::new("MONITOR").size(10.5).strong().color(C_MUTED));
+        let monitors = list_monitors();
+        ui.horizontal_wrapped(|ui| {
+            if chip(ui, "Follow game", self.settings.monitor == 0, 0.0).clicked() { self.settings.monitor = 0; }
+            for (index, monitor) in monitors.iter().enumerate() {
+                let label = if monitor.primary { format!("{} (main)", index + 1) } else { format!("{}", index + 1) };
+                if chip(ui, &label, self.settings.monitor as usize == index + 1, 0.0).clicked() {
+                    self.settings.monitor = (index + 1) as u8;
+                }
+            }
+        });
+        let hint = if self.settings.monitor == 0 {
+            "The overlay moves to the monitor of the app in front."
+        } else {
+            "The overlay always stays on this monitor (numbered left to right)."
+        };
+        ui.label(egui::RichText::new(hint).size(11.5).color(C_MUTED));
+    }
+
+    // The hotkey the user just pressed while a capture button was waiting.
+    fn pressed_hotkey(ctx: &egui::Context) -> Option<Result<String, ()>> {
+        let events = ctx.input(|i| i.events.clone());
+        for event in events {
+            if let egui::Event::Key { key, pressed: true, modifiers, repeat: false, .. } = event {
+                if key == egui::Key::Escape { return Some(Err(())); }
+                let Some(name) = egui_key_name(key) else { continue; };
+                let mut mods = 0;
+                if modifiers.ctrl { mods |= MOD_CONTROL; }
+                if modifiers.alt { mods |= MOD_ALT; }
+                if modifiers.shift { mods |= MOD_SHIFT; }
+                return Some(Ok(format_hotkey(mods, name)));
+            }
+        }
+        None
+    }
+
+    fn hotkey_row(&mut self, ui: &mut egui::Ui, index: u8, title: &str) {
+        let waiting = self.capturing == Some(index);
+        let current = if index == 0 { self.settings.hotkey_toggle.clone() } else { self.settings.hotkey_quit.clone() };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title).color(C_TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if waiting { "Press a key...".to_string() } else { current.clone() };
+                if chip(ui, &label, waiting, 130.0).clicked() {
+                    self.capturing = if waiting { None } else { Some(index) };
+                }
+            });
+        });
+        if waiting {
+            match Self::pressed_hotkey(ui.ctx()) {
+                Some(Ok(text)) => {
+                    if parse_hotkey(&text).is_some() {
+                        if index == 0 { self.settings.hotkey_toggle = text; } else { self.settings.hotkey_quit = text; }
+                        self.status = "Hotkey changed. Press Save to apply it.".to_string();
+                        self.status_error = false;
+                    } else {
+                        self.status = "Letters and digits need Ctrl, Alt or Shift too.".to_string();
+                        self.status_error = true;
+                    }
+                    self.capturing = None;
+                }
+                Some(Err(())) => self.capturing = None,
+                None => ui.ctx().request_repaint(),
+            }
+        }
+    }
+
+    pub(crate) fn draw_system_panel(&mut self, ui: &mut egui::Ui) {
+        card_title(ui, "Hotkeys & startup", "Global keys work inside games too.");
+        ui.add_space(12.0);
+        self.hotkey_row(ui, 0, "Show / hide overlay");
+        ui.add_space(4.0);
+        self.hotkey_row(ui, 1, "Quit overlay");
+        ui.label(egui::RichText::new("Click a button, then press the keys. Esc cancels.").size(11.5).color(C_MUTED));
+
+        ui.add_space(12.0);
+        let before = self.autostart;
+        toggle_row(ui, "Start with Windows", "Runs the overlay in the tray when you sign in.", &mut self.autostart);
+        if self.autostart != before {
+            match set_autostart(self.autostart) {
+                Ok(()) => { self.status = if self.autostart { "Will start with Windows." } else { "Won't start with Windows." }.to_string(); self.status_error = false; }
+                Err(error) => { self.autostart = before; self.status = error; self.status_error = true; }
+            }
+        }
+
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("FPS ACCESS").size(10.5).strong().color(C_MUTED));
+        if has_trace_access() {
+            ui.label(egui::RichText::new("This app can read frame timing.").size(11.5).color(C_MUTED));
+        } else {
+            ui.label(egui::RichText::new("The overlay shows FPS ADMIN when PresentMon lacks permission. Run it as administrator, or add your account to the Performance Log Users group.").size(11.5).color(C_ERROR));
+            ui.add_space(6.0);
+            if action_button(ui, "Restart overlay as admin", BtnKind::Secondary, 190.0).clicked() {
+                match relaunch_overlay_as_admin() {
+                    Ok(()) => { self.status = "Overlay restarting as administrator.".to_string(); self.status_error = false; }
+                    Err(error) => { self.status = error; self.status_error = true; }
+                }
+            }
+        }
     }
 
     pub(crate) fn draw_preview_panel(&mut self, ui: &mut egui::Ui) {
@@ -661,11 +767,11 @@ impl eframe::App for SettingsApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Zoro FPS Overlay").size(18.0).strong().color(C_TEXT));
-                    ui.label(egui::RichText::new("v0.6.2").size(11.0).color(C_MUTED));
+                    ui.label(egui::RichText::new("v0.7.0").size(11.0).color(C_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        key_hint(ui, "F10", "Quit");
+                        key_hint(ui, &self.settings.hotkey_quit.clone(), "Quit");
                         ui.add_space(8.0);
-                        key_hint(ui, "F8", "Hide / show");
+                        key_hint(ui, &self.settings.hotkey_toggle.clone(), "Hide / show");
                     });
                 });
             });
@@ -703,6 +809,8 @@ impl eframe::App for SettingsApp {
                         card(ui, |ui| self.draw_position_panel(ui));
                         ui.add_space(8.0);
                         card(ui, |ui| self.draw_display_panel(ui));
+                        ui.add_space(8.0);
+                        card(ui, |ui| self.draw_system_panel(ui));
                     });
                     // The preview stays pinned while the settings below it scroll.
                     card(&mut columns[1], |ui| self.draw_preview_panel(ui));
@@ -729,10 +837,11 @@ impl eframe::App for SettingsApp {
 }
 
 pub(crate) fn run_settings_gui() {
+    if !claim_settings_instance() { return; }
     let settings_path = settings_file_path();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Zoro FPS Overlay — Settings")
+            .with_title(SETTINGS_TITLE)
             .with_inner_size([900.0, 760.0])
             .with_min_inner_size([780.0, 640.0])
             .with_resizable(true),
@@ -746,4 +855,21 @@ pub(crate) fn run_settings_gui() {
     ) {
         message_box(&format!("Could not start the settings GUI:\n{}", error), "Zoro FPS Overlay");
     }
+}
+
+// Keys the hotkey capture understands, by the name stored in settings.ini.
+fn egui_key_name(key: egui::Key) -> Option<&'static str> {
+    use egui::Key::*;
+    Some(match key {
+        F1 => "F1", F2 => "F2", F3 => "F3", F4 => "F4", F5 => "F5", F6 => "F6",
+        F7 => "F7", F8 => "F8", F9 => "F9", F10 => "F10", F11 => "F11", F12 => "F12",
+        A => "A", B => "B", C => "C", D => "D", E => "E", F => "F", G => "G", H => "H", I => "I",
+        J => "J", K => "K", L => "L", M => "M", N => "N", O => "O", P => "P", Q => "Q", R => "R",
+        S => "S", T => "T", U => "U", V => "V", W => "W", X => "X", Y => "Y", Z => "Z",
+        Num0 => "0", Num1 => "1", Num2 => "2", Num3 => "3", Num4 => "4",
+        Num5 => "5", Num6 => "6", Num7 => "7", Num8 => "8", Num9 => "9",
+        Insert => "Insert", Delete => "Delete", Home => "Home", End => "End",
+        PageUp => "PageUp", PageDown => "PageDown", Pause => "Pause",
+        _ => return None,
+    })
 }
