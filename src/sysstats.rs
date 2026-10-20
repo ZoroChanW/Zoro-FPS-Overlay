@@ -17,6 +17,12 @@ pub(crate) struct SysStats {
     pub(crate) gpu: AtomicU32,
     // The GPU counters are only queried while the GPU item is enabled.
     pub(crate) want_gpu: AtomicBool,
+    // VRAM (used / total, MB) and GPU temperature (degrees C), read only while switched on.
+    pub(crate) vram_used_mb: AtomicU32,
+    pub(crate) vram_total_mb: AtomicU32,
+    pub(crate) gpu_temp: AtomicU32,
+    pub(crate) want_vram: AtomicBool,
+    pub(crate) want_temp: AtomicBool,
 }
 
 impl SysStats {
@@ -26,6 +32,11 @@ impl SysStats {
             ram: AtomicU32::new(STAT_NONE),
             gpu: AtomicU32::new(STAT_NONE),
             want_gpu: AtomicBool::new(false),
+            vram_used_mb: AtomicU32::new(STAT_NONE),
+            vram_total_mb: AtomicU32::new(STAT_NONE),
+            gpu_temp: AtomicU32::new(STAT_NONE),
+            want_vram: AtomicBool::new(false),
+            want_temp: AtomicBool::new(false),
         }
     }
 }
@@ -123,6 +134,7 @@ pub(crate) fn spawn_system_stats_thread(stats: Arc<SysStats>, log_path: PathBuf)
         let mut gpu_error_logged = false;
         let mut gpu_samples_taken = 0u32;
         let mut gpu_misses = 0u32;
+        let mut gpu_info: Option<GpuInfo> = None;
 
         loop {
             unsafe {
@@ -191,6 +203,34 @@ pub(crate) fn spawn_system_stats_thread(stats: Arc<SysStats>, log_path: PathBuf)
             } else if gpu_sampler.is_some() {
                 gpu_sampler = None;
                 stats.gpu.store(STAT_NONE, Ordering::Relaxed);
+            }
+
+            // VRAM and temperature share one set of GPU handles.
+            let want_vram = stats.want_vram.load(Ordering::Relaxed);
+            let want_temp = stats.want_temp.load(Ordering::Relaxed);
+            if want_vram || want_temp {
+                let info = gpu_info.get_or_insert_with(|| GpuInfo::new(&log_path));
+                if want_vram {
+                    match info.vram_mb() {
+                        Some((used, total)) => {
+                            stats.vram_used_mb.store(used, Ordering::Relaxed);
+                            stats.vram_total_mb.store(total, Ordering::Relaxed);
+                        }
+                        None => {
+                            stats.vram_used_mb.store(STAT_NONE, Ordering::Relaxed);
+                            stats.vram_total_mb.store(STAT_NONE, Ordering::Relaxed);
+                        }
+                    }
+                }
+                if want_temp {
+                    let value = info.temperature_c();
+                    stats.gpu_temp.store(value.unwrap_or(STAT_NONE), Ordering::Relaxed);
+                }
+            } else if gpu_info.is_some() {
+                gpu_info = None;
+                stats.vram_used_mb.store(STAT_NONE, Ordering::Relaxed);
+                stats.vram_total_mb.store(STAT_NONE, Ordering::Relaxed);
+                stats.gpu_temp.store(STAT_NONE, Ordering::Relaxed);
             }
 
             std::thread::sleep(Duration::from_millis(1000));

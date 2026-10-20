@@ -68,6 +68,8 @@ pub(crate) struct AppState {
     pub(crate) trace_access: bool,
     // The monitor the overlay window currently sits on.
     pub(crate) screen: RECT,
+    // Recent frame times for the graph (empty when the graph is off or nothing is measured).
+    pub(crate) graph_samples: Vec<f32>,
 }
 
 pub(crate) static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -112,6 +114,8 @@ pub(crate) fn update_overlay(hwnd: HWND) {
                 || new_settings.hotkey_quit != state.settings.hotkey_quit;
             state.settings = new_settings;
             settings_changed = true;
+            // The graph is redrawn more often than plain numbers.
+            unsafe { SetTimer(hwnd, TIMER_ID, timer_interval_ms(&state.settings), None); }
             if hotkeys_changed {
                 let (settings, log_path) = (state.settings.clone(), state.diagnostic_path.clone());
                 register_hotkeys(hwnd, &settings, &log_path);
@@ -121,9 +125,14 @@ pub(crate) fn update_overlay(hwnd: HWND) {
     }
     if let Some(sys) = SYS.get() {
         sys.want_gpu.store(state.settings.show_gpu, Ordering::Relaxed);
+        sys.want_vram.store(state.settings.show_vram, Ordering::Relaxed);
+        sys.want_temp.store(state.settings.show_gpu_temp, Ordering::Relaxed);
         state.values.cpu = stat_value(sys.cpu.load(Ordering::Relaxed));
         state.values.ram = stat_value(sys.ram.load(Ordering::Relaxed));
         state.values.gpu = stat_value(sys.gpu.load(Ordering::Relaxed));
+        state.values.gpu_temp = stat_value(sys.gpu_temp.load(Ordering::Relaxed));
+        state.values.vram_used_mb = stat_value(sys.vram_used_mb.load(Ordering::Relaxed));
+        state.values.vram_total_mb = stat_value(sys.vram_total_mb.load(Ordering::Relaxed));
     }
     let now = Instant::now();
     // The app in front, unless it is the desktop, a system window or this program.
@@ -237,6 +246,15 @@ pub(crate) fn update_overlay(hwnd: HWND) {
         }
     }
 
+    // Frame times for the graph; stale readings are dropped with the FPS value.
+    if state.settings.show_graph && state.values.fps.is_some() {
+        let samples = state.capture.as_ref()
+            .and_then(|capture| capture.stats.frames.lock().ok().map(|f| f.iter().copied().collect::<Vec<f32>>()));
+        state.graph_samples = samples.unwrap_or_default();
+    } else if !state.graph_samples.is_empty() {
+        state.graph_samples.clear();
+    }
+
     let wanted = match class {
         None | Some(AppClass::Never) => false,
         Some(AppClass::Always) => settled,
@@ -303,6 +321,10 @@ pub(crate) unsafe extern "system" fn window_proc(hwnd: HWND, msg: UINT, wparam: 
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+pub(crate) fn timer_interval_ms(settings: &OverlaySettings) -> UINT {
+    if settings.show_graph { 100 } else { 250 }
 }
 
 // Hides or shows the overlay by hand (the toggle hotkey and the tray menu).
@@ -401,10 +423,13 @@ pub(crate) fn run_overlay() {
         recent_path,
         trace_access: has_trace_access(),
         screen: start_screen,
+        graph_samples: Vec::new(),
     }));
 
     let sys_stats = Arc::new(SysStats::new());
     sys_stats.want_gpu.store(settings.show_gpu, Ordering::Relaxed);
+    sys_stats.want_vram.store(settings.show_vram, Ordering::Relaxed);
+    sys_stats.want_temp.store(settings.show_gpu_temp, Ordering::Relaxed);
     let _ = SYS.set(Arc::clone(&sys_stats));
     spawn_system_stats_thread(sys_stats, sys_log_path);
 
@@ -448,7 +473,7 @@ pub(crate) fn run_overlay() {
         // Start hidden. The first supported foreground application makes it visible.
         ShowWindow(hwnd, SW_HIDE);
         register_taskbar_message();
-        let _ = SetTimer(hwnd, TIMER_ID, Duration::from_millis(250).as_millis() as UINT, None);
+        let _ = SetTimer(hwnd, TIMER_ID, timer_interval_ms(&settings), None);
         register_hotkeys(hwnd, &settings, &diagnostic_for_hotkeys);
         add_tray_icon(hwnd);
 

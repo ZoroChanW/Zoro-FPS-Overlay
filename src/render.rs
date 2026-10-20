@@ -119,9 +119,9 @@ pub(crate) fn paint_overlay(hwnd: HWND) {
             .map(|m| format_metric(*m, &s.values, s.fps_note, s.settings.show_labels))
             .collect();
         let samples: Vec<&'static str> = metrics.iter().map(|m| m.sample(s.settings.show_labels)).collect();
-        (texts, samples, s.settings.clone())
+        (texts, samples, s.settings.clone(), s.graph_samples.clone())
     });
-    let Some((texts, samples, settings)) = snapshot else { return; };
+    let Some((texts, samples, settings, graph_samples)) = snapshot else { return; };
 
     unsafe {
         let mut window: RECT = zeroed();
@@ -174,6 +174,18 @@ pub(crate) fn paint_overlay(hwnd: HWND) {
             }
         }
 
+        if settings.show_graph {
+            let graph_w = settings.graph_width.min(width - OVERLAY_PAD_X * 2).max(10);
+            let shadow_off = if settings.shadow { settings.shadow_offset() } else { 0 };
+            let left = match settings.horizontal_anchor {
+                1 => (width - graph_w) / 2,
+                2 => width - OVERLAY_PAD_X - shadow_off - graph_w,
+                _ => OVERLAY_PAD_X,
+            };
+            let top = rects.iter().map(|r| r.bottom).max().unwrap_or(0) + GRAPH_GAP;
+            draw_graph(out_dib.pixels(), width, height, left, top, graph_w, settings.graph_height, &graph_samples, (cr, cg, cb));
+        }
+
         let position = POINT { x: window.left, y: window.top };
         let size = SIZE { cx: width, cy: height };
         let source = POINT { x: 0, y: 0 };
@@ -183,6 +195,45 @@ pub(crate) fn paint_overlay(hwnd: HWND) {
         drop(text_dib);
         drop(shadow_dib);
         ReleaseDC(std::ptr::null_mut(), screen);
+    }
+}
+
+// A small bar graph of recent frame times, newest on the right. Bars that are much taller
+// than the typical frame (stutter) are drawn in red. The scale follows the typical frame time
+// so it does not jump around.
+pub(crate) fn draw_graph(
+    pixels: &mut [u32], width: i32, height: i32, left: i32, top: i32, graph_w: i32, graph_h: i32,
+    samples: &[f32], rgb: (u32, u32, u32),
+) {
+    let index = |x: i32, y: i32| (y * width + x) as usize;
+    let bottom = (top + graph_h).min(height);
+    let right = (left + graph_w).min(width);
+    if left < 0 || top < 0 || bottom <= top || right <= left { return; }
+    // Dark, see-through backdrop so the bars stay readable over a bright game.
+    let backdrop = 120u32 << 24;
+    for y in top..bottom {
+        for x in left..right { pixels[index(x, y)] = backdrop; }
+    }
+    if samples.is_empty() { return; }
+
+    let mut sorted: Vec<f32> = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let typical = sorted[sorted.len() / 2].max(1.0);
+    let scale_max = (typical * 3.0).clamp(20.0, 100.0);
+    let normal = 0xFF00_0000 | (rgb.0 << 16) | (rgb.1 << 8) | rgb.2;
+    let spike = 0xFFFF_6B6Bu32;
+
+    let columns = (right - left).min(samples.len() as i32);
+    let first = samples.len() - columns as usize;
+    let height_px = (bottom - top) as f32;
+    for column in 0..columns {
+        let ms = samples[first + column as usize];
+        let bar = ((ms / scale_max).min(1.0) * height_px).round().max(1.0) as i32;
+        let color = if ms > typical * 1.8 { spike } else { normal };
+        let x = right - columns + column;
+        for step in 0..bar.min(bottom - top) {
+            pixels[index(x, bottom - 1 - step)] = color;
+        }
     }
 }
 

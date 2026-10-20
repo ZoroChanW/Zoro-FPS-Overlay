@@ -472,6 +472,9 @@ impl SettingsApp {
             cpu: Some(23),
             ram: Some(54),
             gpu: Some(41),
+            gpu_temp: Some(62),
+            vram_used_mb: Some(6349),
+            vram_total_mb: Some(12288),
         };
         let texts: Vec<String> = self.settings.metrics().iter()
             .map(|m| format_metric(*m, &sample, "", self.settings.show_labels))
@@ -494,6 +497,17 @@ impl SettingsApp {
             px = (px * available / size.x).max(8.0);
             galleys = layout(px, color);
             size = block_size(&galleys, row, line_gap, item_gap);
+        }
+        // Room for the graph under the text.
+        let text_height = size.y;
+        let graph_size = if self.settings.show_graph {
+            Some(egui::vec2(self.settings.graph_width as f32 * scale, self.settings.graph_height as f32 * scale))
+        } else {
+            None
+        };
+        if let Some(graph) = graph_size {
+            size.y += GRAPH_GAP as f32 * scale + graph.y;
+            size.x = size.x.max(graph.x);
         }
         let shadow_galleys = if self.settings.shadow { layout(px, shadow_color) } else { Vec::new() };
         let shadow_px = (self.settings.shadow_offset() as f32 * scale * 1.6).max(1.0);
@@ -529,7 +543,7 @@ impl SettingsApp {
             let item_w = galley.size().x;
             let item_h = galley.size().y;
             let pos = if row {
-                egui::pos2(cursor_x, y + (size.y - item_h) / 2.0)
+                egui::pos2(cursor_x, y + (text_height - item_h) / 2.0)
             } else {
                 let line_x = match self.settings.horizontal_anchor {
                     0 => 0.0,
@@ -544,6 +558,31 @@ impl SettingsApp {
             painter.galley(pos, galley, color);
             cursor_x += item_w + item_gap;
             cursor_y += item_h + line_gap;
+        }
+
+        // A made-up frame-time trace: mostly even, with a few spikes.
+        if let Some(graph) = graph_size {
+            let graph_x = match self.settings.horizontal_anchor {
+                0 => x,
+                1 => x + (size.x - graph.x) / 2.0,
+                _ => x + size.x - graph.x,
+            };
+            let graph_rect = egui::Rect::from_min_size(egui::pos2(graph_x, y + text_height + GRAPH_GAP as f32 * scale), graph);
+            painter.rect_filled(graph_rect, egui::CornerRadius::same(2), egui::Color32::from_black_alpha(120));
+            let bars = ((graph.x / 2.0) as usize).max(10);
+            let bar_w = graph.x / bars as f32;
+            for i in 0..bars {
+                let wobble = ((i * 7919 + 13) % 17) as f32 / 17.0;
+                let spike = i % 23 == 17;
+                let level = if spike { 0.9 } else { 0.28 + wobble * 0.12 };
+                let bar_h = (graph.y * level).max(1.0);
+                let bar_color = if spike { egui::Color32::from_rgb(255, 107, 107) } else { color };
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(graph_rect.left() + i as f32 * bar_w, graph_rect.bottom() - bar_h),
+                    egui::pos2(graph_rect.left() + (i as f32 + 1.0) * bar_w, graph_rect.bottom()),
+                );
+                painter.rect_filled(bar, egui::CornerRadius::ZERO, bar_color);
+            }
         }
     }
 
@@ -711,6 +750,28 @@ impl SettingsApp {
         toggle_row(ui, "CPU usage", "Total processor load", &mut self.settings.show_cpu);
         toggle_row(ui, "RAM usage", "Physical memory in use", &mut self.settings.show_ram);
         toggle_row(ui, "GPU usage", "Busiest GPU engine, from Windows counters", &mut self.settings.show_gpu);
+        toggle_row(ui, "GPU temperature", "Degrees Celsius (NVIDIA, and AMD/Intel where Windows reports it)", &mut self.settings.show_gpu_temp);
+        toggle_row(ui, "VRAM usage", "Video memory in use / total", &mut self.settings.show_vram);
+        ui.add_space(4.0);
+        toggle_row(ui, "Frametime graph", "Bars of recent frame times under the readings", &mut self.settings.show_graph);
+        if self.settings.show_graph {
+            ui.add_space(6.0);
+            ui.spacing_mut().slider_width = (ui.available_width() - 6.0).max(120.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Graph width").color(C_TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{} px", self.settings.graph_width)).strong().color(C_TEXT));
+                });
+            });
+            ui.add(egui::Slider::new(&mut self.settings.graph_width, 120..=480).show_value(false));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Graph height").color(C_TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{} px", self.settings.graph_height)).strong().color(C_TEXT));
+                });
+            });
+            ui.add(egui::Slider::new(&mut self.settings.graph_height, 30..=120).show_value(false));
+        }
         // At least one item must stay on; a toggle that would turn all off snaps back.
         if ALL_METRICS.iter().all(|m| !self.settings.is_enabled(*m)) {
             self.settings.show_fps = true;
@@ -767,7 +828,7 @@ impl eframe::App for SettingsApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Zoro FPS Overlay").size(18.0).strong().color(C_TEXT));
-                    ui.label(egui::RichText::new("v0.7.0").size(11.0).color(C_MUTED));
+                    ui.label(egui::RichText::new("v0.8.0").size(11.0).color(C_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         key_hint(ui, &self.settings.hotkey_quit.clone(), "Quit");
                         ui.add_space(8.0);

@@ -194,6 +194,30 @@ pub(crate) const ERROR_ALREADY_EXISTS: DWORD = 183;
 pub(crate) const SW_RESTORE: i32 = 9;
 pub(crate) const SW_SHOWNORMAL: i32 = 1;
 
+#[repr(C)]
+pub(crate) struct GUID { pub(crate) d1: u32, pub(crate) d2: u16, pub(crate) d3: u16, pub(crate) d4: [u8; 8] }
+#[repr(C)]
+pub(crate) struct DXGI_ADAPTER_DESC1 {
+    pub(crate) description: [u16; 128], pub(crate) vendor_id: u32, pub(crate) device_id: u32,
+    pub(crate) sub_sys_id: u32, pub(crate) revision: u32, pub(crate) dedicated_video_memory: usize,
+    pub(crate) dedicated_system_memory: usize, pub(crate) shared_system_memory: usize,
+    pub(crate) luid_low: u32, pub(crate) luid_high: i32, pub(crate) flags: u32,
+}
+pub(crate) const DXGI_ADAPTER_FLAG_SOFTWARE: u32 = 2;
+#[repr(C)]
+pub(crate) struct D3DKMT_OPENADAPTERFROMLUID { pub(crate) luid_low: u32, pub(crate) luid_high: i32, pub(crate) handle: u32 }
+#[repr(C)]
+pub(crate) struct D3DKMT_CLOSEADAPTER { pub(crate) handle: u32 }
+#[repr(C)]
+pub(crate) struct D3DKMT_QUERYADAPTERINFO { pub(crate) handle: u32, pub(crate) kind: u32, pub(crate) data: *mut c_void, pub(crate) size: u32 }
+#[repr(C)]
+pub(crate) struct D3DKMT_ADAPTER_PERFDATA {
+    pub(crate) physical_adapter_index: u32, pub(crate) memory_frequency: u64, pub(crate) max_memory_frequency: u64,
+    pub(crate) max_memory_frequency_oc: u64, pub(crate) memory_bandwidth: u64, pub(crate) pcie_bandwidth: u64,
+    pub(crate) fan_rpm: u32, pub(crate) power: u32, pub(crate) temperature: u32, pub(crate) power_state_override: u8,
+}
+pub(crate) const KMTQAITYPE_ADAPTERPERFDATA: u32 = 62;
+
 #[link(name = "pdh")]
 extern "system" {
     pub(crate) fn PdhOpenQueryW(data_source: LPCWSTR, user_data: usize, query: *mut HANDLE) -> i32;
@@ -252,6 +276,11 @@ extern "system" {
     pub(crate) fn DrawTextW(hdc: HDC, text: LPCWSTR, count: i32, rect: *mut RECT, format: UINT) -> i32;
 }
 
+#[link(name = "dxgi")]
+extern "system" {
+    pub(crate) fn CreateDXGIFactory1(riid: *const GUID, factory: *mut *mut c_void) -> i32;
+}
+
 #[link(name = "advapi32")]
 extern "system" {
     pub(crate) fn AllocateAndInitializeSid(authority: *const [u8; 6], sub_count: u8,
@@ -275,6 +304,8 @@ extern "system" {
 
 #[link(name = "kernel32")]
 extern "system" {
+    pub(crate) fn LoadLibraryW(name: LPCWSTR) -> HANDLE;
+    pub(crate) fn GetProcAddress(module: HANDLE, name: *const u8) -> *mut c_void;
     pub(crate) fn CreateMutexW(attributes: *const c_void, initial_owner: BOOL, name: LPCWSTR) -> HANDLE;
     pub(crate) fn GetLastError() -> DWORD;
     pub(crate) fn CreateJobObjectW(attributes: *const c_void, name: LPCWSTR) -> HANDLE;
@@ -299,6 +330,9 @@ extern "system" {
         charset: DWORD, output_precision: DWORD, clip_precision: DWORD,
         quality: DWORD, pitch_and_family: DWORD, face_name: LPCWSTR) -> HFONT;
     pub(crate) fn SelectObject(hdc: HDC, object: HGDIOBJ) -> HGDIOBJ;
+    pub(crate) fn D3DKMTOpenAdapterFromLuid(data: *mut D3DKMT_OPENADAPTERFROMLUID) -> i32;
+    pub(crate) fn D3DKMTQueryAdapterInfo(data: *const D3DKMT_QUERYADAPTERINFO) -> i32;
+    pub(crate) fn D3DKMTCloseAdapter(data: *const D3DKMT_CLOSEADAPTER) -> i32;
     pub(crate) fn CreateCompatibleDC(hdc: HDC) -> HDC;
     pub(crate) fn CreateBitmap(width: i32, height: i32, planes: UINT, bits_per_pixel: UINT, bits: *const c_void) -> HBITMAP;
     pub(crate) fn DeleteDC(hdc: HDC) -> BOOL;

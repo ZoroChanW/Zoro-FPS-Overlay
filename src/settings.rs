@@ -5,10 +5,12 @@ use std::path::PathBuf;
 use crate::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Metric { Fps, Frametime, Low1, Cpu, Ram, Gpu }
+pub(crate) enum Metric { Fps, Frametime, Low1, Cpu, Ram, Gpu, GpuTemp, Vram }
 
 // Order in which enabled items appear on the overlay.
-pub(crate) const ALL_METRICS: [Metric; 6] = [Metric::Fps, Metric::Frametime, Metric::Low1, Metric::Cpu, Metric::Ram, Metric::Gpu];
+pub(crate) const ALL_METRICS: [Metric; 8] = [
+    Metric::Fps, Metric::Frametime, Metric::Low1, Metric::Cpu, Metric::Ram, Metric::Gpu, Metric::GpuTemp, Metric::Vram,
+];
 pub(crate) const FONT_FAMILIES: [&str; 7] = ["Segoe UI", "Consolas", "Arial", "Tahoma", "Verdana", "Bahnschrift", "Courier New"];
 
 impl Metric {
@@ -23,6 +25,10 @@ impl Metric {
             (Metric::Cpu, true) => "CPU 100%",
             (Metric::Ram, true) => "RAM 100%",
             (Metric::Gpu, true) => "GPU 100%",
+            (Metric::GpuTemp, true) => "GPU 100\u{b0}C",
+            (Metric::GpuTemp, false) => "100\u{b0}C",
+            (Metric::Vram, true) => "VRAM 24.0/24 GB",
+            (Metric::Vram, false) => "24.0/24 GB",
             (_, false) => "100%",
         }
     }
@@ -37,6 +43,9 @@ pub(crate) struct MetricValues {
     pub(crate) cpu: Option<u32>,
     pub(crate) ram: Option<u32>,
     pub(crate) gpu: Option<u32>,
+    pub(crate) gpu_temp: Option<u32>,
+    pub(crate) vram_used_mb: Option<u32>,
+    pub(crate) vram_total_mb: Option<u32>,
 }
 
 pub(crate) fn percent_text(label: &str, value: Option<u32>, labels: bool) -> String {
@@ -71,6 +80,31 @@ pub(crate) fn format_metric(metric: Metric, values: &MetricValues, note: &str, l
         Metric::Cpu => percent_text("CPU", values.cpu, labels),
         Metric::Ram => percent_text("RAM", values.ram, labels),
         Metric::Gpu => percent_text("GPU", values.gpu, labels),
+        Metric::GpuTemp => match (values.gpu_temp, labels) {
+            (Some(v), true) => format!("GPU {}\u{b0}C", v),
+            (Some(v), false) => format!("{}\u{b0}C", v),
+            (None, true) => "GPU --".to_string(),
+            (None, false) => "--".to_string(),
+        },
+        Metric::Vram => match (values.vram_used_mb, values.vram_total_mb, labels) {
+            (Some(used), Some(total), true) => format!("VRAM {}/{} GB", gb_text(used, 1), gb_text(total, 0)),
+            (Some(used), Some(total), false) => format!("{}/{} GB", gb_text(used, 1), gb_text(total, 0)),
+            (Some(used), None, true) => format!("VRAM {} GB", gb_text(used, 1)),
+            (Some(used), None, false) => format!("{} GB", gb_text(used, 1)),
+            (None, _, true) => "VRAM --".to_string(),
+            (None, _, false) => "--".to_string(),
+        },
+    }
+}
+
+// Megabytes as gigabytes with the given decimals; a whole-number size such as a 12 GB
+// card is shown without a ".0".
+pub(crate) fn gb_text(megabytes: u32, decimals: usize) -> String {
+    let gb = megabytes as f64 / 1024.0;
+    if decimals == 0 && (gb - gb.round()).abs() > 0.05 {
+        format!("{:.1}", gb)
+    } else {
+        format!("{:.*}", decimals, gb)
     }
 }
 
@@ -91,6 +125,12 @@ pub(crate) struct OverlaySettings {
     pub(crate) show_cpu: bool,
     pub(crate) show_ram: bool,
     pub(crate) show_gpu: bool,
+    pub(crate) show_gpu_temp: bool,
+    pub(crate) show_vram: bool,
+    // Optional frametime graph under the readings.
+    pub(crate) show_graph: bool,
+    pub(crate) graph_width: i32,
+    pub(crate) graph_height: i32,
     // 0 = items stacked in a column, 1 = items side by side in a row.
     pub(crate) layout: u8,
     // Gap between stacked lines (column) and between items (row), in pixels.
@@ -128,6 +168,11 @@ impl Default for OverlaySettings {
             show_cpu: false,
             show_ram: false,
             show_gpu: false,
+            show_gpu_temp: false,
+            show_vram: false,
+            show_graph: false,
+            graph_width: 240,
+            graph_height: 56,
             layout: 0,
             line_gap: 2,
             item_gap: 18,
@@ -155,6 +200,8 @@ impl OverlaySettings {
             Metric::Cpu => self.show_cpu,
             Metric::Ram => self.show_ram,
             Metric::Gpu => self.show_gpu,
+            Metric::GpuTemp => self.show_gpu_temp,
+            Metric::Vram => self.show_vram,
         }
     }
 
@@ -176,6 +223,8 @@ impl OverlaySettings {
         self.font_size = self.font_size.clamp(18, 64);
         self.layout = self.layout.min(1);
         self.line_gap = self.line_gap.clamp(0, 40);
+        self.graph_width = self.graph_width.clamp(120, 480);
+        self.graph_height = self.graph_height.clamp(30, 120);
         self.item_gap = self.item_gap.clamp(0, 60);
         // Only fonts from the known list are accepted (the value ends up in CreateFontW).
         self.font_family = FONT_FAMILIES
@@ -225,6 +274,12 @@ impl OverlaySettings {
             (max_w, line_h * count + self.line_gap * (count - 1))
         };
         let shadow = if self.shadow { self.shadow_offset() } else { 0 };
+        // The optional graph sits under the text and may be wider than it.
+        let (text_w, text_h) = if self.show_graph {
+            (text_w.max(self.graph_width), text_h + GRAPH_GAP + self.graph_height)
+        } else {
+            (text_w, text_h)
+        };
         (text_w + OVERLAY_PAD_X * 2 + 2 + shadow, text_h + OVERLAY_PAD_Y * 2 + shadow)
     }
 }
@@ -422,6 +477,11 @@ pub(crate) fn load_settings(path: &PathBuf) -> OverlaySettings {
             "show_cpu" => result.show_cpu = value == "1",
             "show_ram" => result.show_ram = value == "1",
             "show_gpu" => result.show_gpu = value == "1",
+            "show_gpu_temp" => result.show_gpu_temp = value == "1",
+            "show_vram" => result.show_vram = value == "1",
+            "show_graph" => result.show_graph = value == "1",
+            "graph_width" => if let Ok(v) = value.parse::<i32>() { result.graph_width = v; },
+            "graph_height" => if let Ok(v) = value.parse::<i32>() { result.graph_height = v; },
             "layout" => if let Ok(v) = value.parse::<u8>() { result.layout = v; },
             "line_gap" => if let Ok(v) = value.parse::<i32>() { result.line_gap = v; },
             "item_gap" => if let Ok(v) = value.parse::<i32>() { result.item_gap = v; },
@@ -448,13 +508,16 @@ pub(crate) fn save_settings(path: &PathBuf, settings: &OverlaySettings) -> Resul
     }
     let content = format!(
         "horizontal_anchor={}\nvertical_anchor={}\noffset_x={}\noffset_y={}\nfont_size={}\ncolor={}\n\
-         show_fps={}\nshow_frametime={}\nshow_low1={}\nshow_cpu={}\nshow_ram={}\nshow_gpu={}\n\
+         show_fps={}\nshow_frametime={}\nshow_low1={}\nshow_cpu={}\nshow_ram={}\nshow_gpu={}\nshow_gpu_temp={}\nshow_vram={}\n\
+         show_graph={}\ngraph_width={}\ngraph_height={}\n\
          layout={}\nline_gap={}\nitem_gap={}\nshow_labels={}\nbold={}\nshadow={}\nfont_family={}\n\
          hotkey_toggle={}\nhotkey_quit={}\nmonitor={}\nvisibility={}\nalways_apps={}\nnever_apps={}\n",
         settings.horizontal_anchor, settings.vertical_anchor, settings.offset_x,
         settings.offset_y, settings.font_size, settings.color_hex,
         settings.show_fps as u8, settings.show_frametime as u8, settings.show_low1 as u8,
         settings.show_cpu as u8, settings.show_ram as u8, settings.show_gpu as u8,
+        settings.show_gpu_temp as u8, settings.show_vram as u8,
+        settings.show_graph as u8, settings.graph_width, settings.graph_height,
         settings.layout, settings.line_gap, settings.item_gap,
         settings.show_labels as u8, settings.bold as u8, settings.shadow as u8,
         settings.font_family, settings.hotkey_toggle, settings.hotkey_quit, settings.monitor, settings.visibility,
@@ -583,6 +646,83 @@ mod tests {
         let (x, y, w, h) = place_overlay(&s, &screen, 300, 80);
         assert!(x >= screen.left && x + w <= screen.right);
         assert!(y >= screen.top && y + h <= screen.bottom);
+    }
+
+    #[test]
+    fn gpu_temperature_and_vram_format_with_and_without_labels() {
+        let values = MetricValues {
+            gpu_temp: Some(62),
+            vram_used_mb: Some(6349),
+            vram_total_mb: Some(12288),
+            ..Default::default()
+        };
+        assert_eq!(format_metric(Metric::GpuTemp, &values, "", true), "GPU 62\u{b0}C");
+        assert_eq!(format_metric(Metric::GpuTemp, &values, "", false), "62\u{b0}C");
+        assert_eq!(format_metric(Metric::Vram, &values, "", true), "VRAM 6.2/12 GB");
+        assert_eq!(format_metric(Metric::Vram, &values, "", false), "6.2/12 GB");
+        let missing = MetricValues::default();
+        assert_eq!(format_metric(Metric::GpuTemp, &missing, "", true), "GPU --");
+        assert_eq!(format_metric(Metric::Vram, &missing, "", true), "VRAM --");
+        let no_total = MetricValues { vram_used_mb: Some(2048), ..Default::default() };
+        assert_eq!(format_metric(Metric::Vram, &no_total, "", true), "VRAM 2.0 GB");
+    }
+
+    #[test]
+    fn gigabytes_are_shown_compactly() {
+        assert_eq!(gb_text(12288, 0), "12");
+        assert_eq!(gb_text(8192, 0), "8");
+        assert_eq!(gb_text(5632, 0), "5.5");
+        assert_eq!(gb_text(1536, 1), "1.5");
+    }
+
+    #[test]
+    fn longest_sample_fits_every_new_item() {
+        for metric in ALL_METRICS {
+            for labels in [true, false] {
+                let widest = metric.sample(labels);
+                let values = MetricValues {
+                    fps: Some(1000), frametime_ms: Some(1000.0), low1: Some(1000), cpu: Some(100), ram: Some(100),
+                    gpu: Some(100), gpu_temp: Some(100), vram_used_mb: Some(24 * 1024), vram_total_mb: Some(24 * 1024),
+                };
+                let shown = format_metric(metric, &values, "", labels);
+                assert!(shown.chars().count() <= widest.chars().count(), "{:?}: {} vs {}", metric, shown, widest);
+            }
+        }
+    }
+
+    #[test]
+    fn graph_settings_are_kept_in_range_and_saved() {
+        let mut s = OverlaySettings::default();
+        s.show_graph = true;
+        s.show_vram = true;
+        s.show_gpu_temp = true;
+        s.graph_width = 10;
+        s.graph_height = 500;
+        s.normalize();
+        assert_eq!((s.graph_width, s.graph_height), (120, 120));
+        let path = std::env::temp_dir().join(format!("zoro-graph-test-{}.ini", std::process::id()));
+        save_settings(&path, &s).unwrap();
+        let loaded = load_settings(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(loaded, s);
+    }
+
+    #[test]
+    fn graph_draws_inside_its_rectangle_only() {
+        let (width, height) = (60, 40);
+        let mut pixels = vec![0u32; (width * height) as usize];
+        let samples: Vec<f32> = (0..100).map(|i| if i == 90 { 60.0 } else { 8.0 }).collect();
+        draw_graph(&mut pixels, width, height, 10, 5, 40, 20, &samples, (200, 200, 200));
+        for y in 0..height {
+            for x in 0..width {
+                let inside = (10..50).contains(&x) && (5..25).contains(&y);
+                if !inside { assert_eq!(pixels[(y * width + x) as usize], 0, "pixel {},{} touched", x, y); }
+            }
+        }
+        // The spike is drawn in red, normal frames in the text colour.
+        let reds = pixels.iter().filter(|p| **p == 0xFFFF_6B6B).count();
+        assert!(reds > 0);
+        assert!(pixels.iter().any(|p| *p == 0xFFC8_C8C8));
     }
 
     #[test]

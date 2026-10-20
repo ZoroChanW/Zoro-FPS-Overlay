@@ -6,14 +6,15 @@
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
-A lightweight, minimal FPS overlay for Windows. It shows FPS, frametime, 1% lows and CPU / RAM / GPU usage on top of your game, and it does that **without injecting anything into the game**.
+A lightweight, minimal FPS overlay for Windows. It shows FPS, frametime, 1% lows, CPU / RAM / GPU usage, GPU temperature, VRAM usage and an optional frametime graph on top of your game, and it does that **without injecting anything into the game**.
 
 <!-- Add a screenshot of the overlay and of the settings window here, for example:
 ![Settings window](docs/settings.png) -->
 
 ## Highlights
 
-- **Six readings, each one switchable:** FPS, frametime, 1% low, CPU usage, RAM usage and GPU usage.
+- **Eight readings, each one switchable:** FPS, frametime, 1% low, CPU usage, RAM usage, GPU usage, GPU temperature and VRAM usage.
+- **Optional frametime graph:** a small bar graph under the numbers, with spikes in red. Off by default, with adjustable size.
 - **Column or row layout:** stack the readings vertically or line them up side by side.
 - **No injection, no hooking:** frame timing comes from [PresentMon](https://github.com/GameTechDev/PresentMon) and the overlay is a separate, click-through window. Nothing is loaded into the game process.
 - **Made to be adjusted:** 9 screen anchors with pixel offsets, 7 fonts, size, color, bold, text shadow, labels and spacing, with a live preview.
@@ -31,8 +32,11 @@ A lightweight, minimal FPS overlay for Windows. It shows FPS, frametime, 1% lows
 | **CPU usage** | Total processor load across all cores. |
 | **RAM usage** | Share of physical memory in use. |
 | **GPU usage** | Load of the busiest GPU engine, from the Windows "GPU Engine" performance counters (the same source Task Manager uses). Works with NVIDIA, AMD and Intel GPUs. |
+| **GPU temperature** | Core temperature of your main GPU in °C. NVIDIA cards are read through the driver's `nvml.dll`; other GPUs through the Windows graphics kernel (best effort, depends on the driver). Shows `GPU --` if the driver does not report it. |
+| **VRAM usage** | Dedicated video memory in use, e.g. `VRAM 6.2/12 GB`. NVIDIA through `nvml.dll`; others through the Windows "GPU Adapter Memory" counters plus DXGI for the total. |
+| **Frametime graph** | The last few hundred frames as bars, newest on the right. The scale follows your typical frametime, and frames much slower than usual are drawn in red. |
 
-The GPU counters are only queried while the GPU item is switched on.
+Each GPU reading is only queried while its item is switched on, and the graph only costs anything while it is shown.
 
 ## Getting started
 
@@ -85,7 +89,8 @@ While it runs, the overlay has an icon in the notification area. Right-click it 
 | --- | --- |
 | **Position** | 9 anchors (corners, edges, center) plus X/Y offsets in pixels. Positive X moves right, positive Y moves down, whichever anchor you pick. |
 | **Layout** | Column (one item per line) or Row (items side by side). Spacing is adjustable for each. |
-| **Items** | FPS, frametime, 1% low, CPU, RAM, GPU. At least one stays on. |
+| **Items** | FPS, frametime, 1% low, CPU, RAM, GPU, GPU temperature, VRAM. At least one stays on. |
+| **Frametime graph** | Optional. Width 120 to 480 px and height 30 to 120 px, drawn below the numbers in the overlay's text color. |
 | **Labels** | Show `CPU 23%` or just `23%`. |
 | **Font** | Segoe UI, Consolas, Arial, Tahoma, Verdana, Bahnschrift or Courier New. The font must be installed. Consolas keeps digits evenly spaced. |
 | **Size and color** | Text size of 18 to 64 px, and any `RRGGBB` color. |
@@ -106,7 +111,9 @@ Settings are stored in `%APPDATA%\ZoroFPSOverlay\settings.ini`. The running over
 | `offset_x`, `offset_y` | pixels, -4000 to 4000 | `0` |
 | `font_size` | 18 to 64 | `34` |
 | `color` | `RRGGBB` | `E8E4D9` |
-| `show_fps`, `show_frametime`, `show_low1`, `show_cpu`, `show_ram`, `show_gpu` | `1` or `0` | FPS on, the rest off |
+| `show_fps`, `show_frametime`, `show_low1`, `show_cpu`, `show_ram`, `show_gpu`, `show_gpu_temp`, `show_vram` | `1` or `0` | FPS on, the rest off |
+| `show_graph` | `1` or `0` | `0` |
+| `graph_width`, `graph_height` | pixels, 120 to 480 and 30 to 120 | `240`, `56` |
 | `layout` | `0` column, `1` row | `0` |
 | `line_gap` | pixels between lines (column), 0 to 40 | `2` |
 | `item_gap` | pixels between items (row), 0 to 60 | `18` |
@@ -133,7 +140,7 @@ Detection is a heuristic, not a guarantee. If it ever picks wrong, a Show or Hid
 
 - **Frame timing** is read by a hidden [PresentMon](https://github.com/GameTechDev/PresentMon) process that watches the application in the foreground. The overlay parses its CSV output and computes FPS, frametime and 1% low.
 - **The overlay** is an always-on-top, click-through Win32 window drawn with per-pixel alpha (greyscale antialiased text, fully transparent elsewhere), so there is no halo or noise around the text on any background. It is sized to fit its text exactly, so right-anchored text can reach the very edge of the monitor.
-- **CPU and RAM** come from `GetSystemTimes` and `GlobalMemoryStatusEx`. **GPU** comes from the Windows PDH "GPU Engine" counters. They refresh once per second.
+- **CPU and RAM** come from `GetSystemTimes` and `GlobalMemoryStatusEx`. **GPU usage** comes from the Windows PDH "GPU Engine" counters. **GPU temperature and VRAM** come from NVML (NVIDIA) or from DXGI, D3DKMT and PDH (everything else). They refresh once per second. The graph is fed by every frame PresentMon reports.
 - **The settings window** is the only part that uses `egui`/`eframe` (Glow renderer, so the default `wgpu` stack is not pulled in).
 
 Nothing is injected into the game, and no game memory is read.
@@ -143,6 +150,8 @@ Nothing is injected into the game, and no game memory is read.
 - **Windows only**, tested on Windows 10 and 11.
 - **Fullscreen Exclusive** games may cover the overlay. Windowed, borderless and most "fullscreen" DirectX 11/12 games (which Windows runs in a borderless-like mode) work. Measuring FPS and drawing on top of a game are two separate problems, and the second one is up to Windows and the game.
 - **GPU usage** needs the Windows "GPU Engine" counters (Windows 10 1709 or newer with a WDDM 2.0+ driver). If they are not available, the item shows `GPU --`.
+- **GPU temperature** is the GPU only. CPU temperature is not shown: Windows does not expose it without a kernel driver, and this project deliberately installs none. On non-NVIDIA GPUs the temperature depends on the driver and may be missing.
+- **Laptops with two GPUs:** reading NVIDIA temperature or VRAM can keep the dedicated GPU awake while those items are switched on.
 - **Anti-cheat:** the overlay does not touch game processes, but it is a third-party tool. If you play online games with strict anti-cheat, use it at your own discretion.
 
 ## Troubleshooting
@@ -159,15 +168,15 @@ The overlay writes two log files to your temp folder (`%TEMP%`):
 | `FPS ERR` | PresentMon could not start or exited. Check the PresentMon log. |
 | `FPS ...` | Waiting for the first frames from the game. |
 | `GPU --` | The GPU counters are unavailable or still warming up. Wait a few seconds, then check the diagnostic log. |
+| `GPU --` / `VRAM --` on the temperature or VRAM item | The driver does not report it. The diagnostic log says which source was used. |
 | Overlay is hidden in a game | The game is probably in exclusive fullscreen. Switch it to borderless or windowed. |
 
 ## Roadmap
 
 Ideas, not promises:
 
-- Per-game profiles and a frametime graph.
+- Per-game profiles.
 - Benchmark mode (session summary and CSV).
-- VRAM usage and CPU/GPU temperatures.
 - Detect exclusive fullscreen and offer a fallback.
 
 ## Project layout
@@ -183,10 +192,16 @@ Ideas, not promises:
 | `src/render.rs` | Per-pixel-alpha text rendering. |
 | `src/capture.rs` | PresentMon process control and CSV parsing. |
 | `src/sysstats.rs` | CPU / RAM / GPU readings. |
+| `src/gpuinfo.rs` | GPU temperature and VRAM (NVML, DXGI, D3DKMT, PDH). |
 | `src/gui.rs` | The egui settings window. |
 | `src/util.rs`, `src/config.rs` | Helpers and tunable constants. |
 
 ## Changelog
+
+**v0.8.0**
+- GPU temperature and VRAM usage as new switchable items.
+- Optional frametime graph with adjustable size (off by default).
+- Windows without an NVIDIA driver fall back to DXGI / D3DKMT / PDH for temperature and VRAM.
 
 **v0.7.0**
 - Multi-monitor: the overlay follows the monitor of the app in front, or stays on a monitor you choose.

@@ -3,7 +3,7 @@ use std::os::windows::process::CommandExt;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::os::windows::io::AsRawHandle;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
@@ -22,6 +22,8 @@ pub(crate) struct SharedStats {
     pub(crate) frametime_x100: AtomicU32,
     pub(crate) low1_fps: AtomicU32,
     pub(crate) last_sample_ms: AtomicU64,
+    // Recent frame times in milliseconds (newest last), for the optional graph.
+    pub(crate) frames: Mutex<VecDeque<f32>>,
 }
 
 pub(crate) struct Capture {
@@ -342,6 +344,10 @@ pub(crate) fn spawn_csv_reader<R: Read + Send + 'static>(
                 continue;
             }
 
+            if let Ok(mut frames) = stats.frames.lock() {
+                frames.push_back(ms as f32);
+                while frames.len() > GRAPH_HISTORY { frames.pop_front(); }
+            }
             intervals.push(ms);
             if intervals.len() > 30 {
                 intervals.remove(0);
